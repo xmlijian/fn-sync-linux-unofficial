@@ -43,7 +43,7 @@ pub struct TaskCreate {
     pub is_init_sync: i64,
     #[serde(default)]
     pub filter_rule: Option<FilterRuleInput>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_flag")]
     pub open_cloud: i64,
 }
 
@@ -75,13 +75,19 @@ fn deserialize_extensions<'de, D: serde::Deserializer<'de>>(d: D) -> std::result
     })
 }
 
+fn deserialize_flag<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<i64, D::Error> {
+    let value = deserialize_optional_integer(d)?.unwrap_or(0);
+    if value == 0 || value == 1 { Ok(value) } else { Err(serde::de::Error::custom("expected boolean or 0/1")) }
+}
+
 fn deserialize_optional_integer<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<i64>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum Input { Number(i64), Text(String) }
+    enum Input { Number(i64), Text(String), Bool(bool) }
     match Option::<Input>::deserialize(d)? {
         None => Ok(None),
         Some(Input::Number(n)) => Ok(Some(n)),
+        Some(Input::Bool(b)) => Ok(Some(i64::from(b))),
         Some(Input::Text(s)) if s.trim().is_empty() => Ok(None),
         Some(Input::Text(s)) => s.parse().map(Some).map_err(serde::de::Error::custom),
     }
@@ -213,6 +219,7 @@ pub async fn get_task_by_id(pool: &SqlitePool, id: i64) -> Result<Option<Task>> 
 pub struct TaskUpdate {
     pub name: Option<String>,
     pub mode: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_integer")]
     pub open_cloud: Option<i64>,
 }
 
@@ -450,5 +457,21 @@ mod ipc_input_tests {
         assert_eq!(input.ignore_extensions, vec!["tmp"]);
         assert_eq!(input.size_upper_bound, None);
         assert!(serde_json::from_value::<super::FilterRuleInput>(serde_json::json!({"size_lower_bound":"invalid"})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod official_create_tests {
+    #[test]
+    fn full_task_create_and_update_payloads_accept_switches() {
+        let input = serde_json::json!({"name":"test", "address":"nas:5667", "conn_type":"ip",
+            "uuid":"123", "identifier":"test", "mode":"bisynchronous", "nas_path":"vol1/1000/test",
+            "pc_path":"/tmp/test", "status":0, "nas_acc_id":1, "is_init_sync":0, "open_cloud":true,
+            "filter_rule":{"ignore_dotfiles":1,"enable_ignore_ext":1,"ignore_extensions":"lnk,pst,swp",
+                "enable_size_lower":0,"size_lower_bound":"0","enable_size_upper":0,"size_upper_bound":"0"}});
+        let task: super::TaskCreate = serde_json::from_value(input).unwrap();
+        assert_eq!(task.open_cloud, 1);
+        let update: super::TaskUpdate = serde_json::from_value(serde_json::json!({"open_cloud":false})).unwrap();
+        assert_eq!(update.open_cloud, Some(0));
     }
 }
