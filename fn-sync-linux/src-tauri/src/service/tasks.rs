@@ -53,7 +53,11 @@ pub struct FilterRuleInput {
     pub ignore_dotfiles: i64,
     #[serde(default = "default_true")]
     pub enable_ignore_ext: i64,
-    #[serde(default, deserialize_with = "deserialize_extensions")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_extensions",
+        serialize_with = "serialize_extensions"
+    )]
     pub ignore_extensions: Vec<String>,
     #[serde(default)]
     pub enable_size_lower: i64,
@@ -65,25 +69,52 @@ pub struct FilterRuleInput {
     pub size_upper_bound: Option<i64>,
 }
 
-fn deserialize_extensions<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<String>, D::Error> {
+fn serialize_extensions<S: serde::Serializer>(
+    items: &[String],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&items.join(","))
+}
+
+fn deserialize_extensions<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Vec<String>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum Input { List(Vec<String>), Csv(String) }
+    enum Input {
+        List(Vec<String>),
+        Csv(String),
+    }
     Ok(match Input::deserialize(d)? {
         Input::List(list) => list,
-        Input::Csv(csv) => csv.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect(),
+        Input::Csv(csv) => csv
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
     })
 }
 
 fn deserialize_flag<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<i64, D::Error> {
     let value = deserialize_optional_integer(d)?.unwrap_or(0);
-    if value == 0 || value == 1 { Ok(value) } else { Err(serde::de::Error::custom("expected boolean or 0/1")) }
+    if value == 0 || value == 1 {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom("expected boolean or 0/1"))
+    }
 }
 
-fn deserialize_optional_integer<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<i64>, D::Error> {
+fn deserialize_optional_integer<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<i64>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum Input { Number(i64), Text(String), Bool(bool) }
+    enum Input {
+        Number(i64),
+        Text(String),
+        Bool(bool),
+    }
     match Option::<Input>::deserialize(d)? {
         None => Ok(None),
         Some(Input::Number(n)) => Ok(Some(n)),
@@ -142,11 +173,9 @@ pub async fn add_task(pool: &SqlitePool, task: &TaskCreate) -> Result<i64> {
         anyhow::bail!("task.nameExistsWithName");
     }
     let now = now_ms();
-    let next_id: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(id), 0) + 1 FROM tasks",
-    )
-    .fetch_one(pool)
-    .await?;
+    let next_id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) + 1 FROM tasks")
+        .fetch_one(pool)
+        .await?;
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO tasks (id, nas_acc_id, name, address, conn_type, uuid, identifier, mode, \
          nas_path, pc_path, status, is_init_sync, open_cloud, created_at, updated_at) \
@@ -217,6 +246,7 @@ pub async fn get_task_by_id(pool: &SqlitePool, id: i64) -> Result<Option<Task>> 
 
 #[derive(Debug, Deserialize)]
 pub struct TaskUpdate {
+    pub filter_rule: Option<FilterRuleInput>,
     pub name: Option<String>,
     pub mode: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_integer")]
@@ -226,16 +256,26 @@ pub struct TaskUpdate {
 pub async fn update_task(pool: &SqlitePool, id: i64, upd: &TaskUpdate) -> Result<()> {
     if let Some(name) = &upd.name {
         validate_app_name(name)?;
-        let dup: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM tasks WHERE name = ?1 AND id != ?2",
-        )
-        .bind(name)
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+        let dup: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM tasks WHERE name = ?1 AND id != ?2")
+                .bind(name)
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
         if dup.is_some() {
             anyhow::bail!("task.nameExistsWithName");
         }
+    }
+    if let Some(mode) = &upd.mode {
+        if !VALID_MODES.contains(&mode.as_str()) {
+            anyhow::bail!("unsupported sync mode: {mode}");
+        }
+    }
+    if let Some(rule) = &upd.filter_rule {
+        sqlx::query("UPDATE task_filter_rules SET ignore_dotfiles=?1, enable_ignore_ext=?2, ignore_extensions=?3, enable_size_lower=?4, size_lower_bound=?5, enable_size_upper=?6, size_upper_bound=?7, updated_at=?8 WHERE task_id=?9")
+            .bind(rule.ignore_dotfiles).bind(rule.enable_ignore_ext).bind(rule.ignore_extensions.join(","))
+            .bind(rule.enable_size_lower).bind(rule.size_lower_bound).bind(rule.enable_size_upper).bind(rule.size_upper_bound)
+            .bind(now_ms()).bind(id).execute(pool).await?;
     }
     sqlx::query(
         "UPDATE tasks SET name = COALESCE(?1, name), mode = COALESCE(?2, mode), \
@@ -262,6 +302,11 @@ pub async fn update_task_status(pool: &SqlitePool, id: i64, status: i64) -> Resu
 }
 
 pub async fn delete_task(pool: &SqlitePool, id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM system_table WHERE key IN (?1,?2)")
+        .bind(format!("sync_snapshot_{id}"))
+        .bind(format!("folder_filter_paths_{id}"))
+        .execute(pool)
+        .await?;
     sqlx::query("DELETE FROM task_filter_rules WHERE task_id=?1")
         .bind(id)
         .execute(pool)
@@ -333,12 +378,12 @@ pub async fn save_folder_filter_paths(
 
 pub async fn get_folder_filter_paths(pool: &SqlitePool, task_id: i64) -> Result<Vec<String>> {
     let key = format!("folder_filter_paths_{task_id}");
-    let v: Option<String> =
-        sqlx::query_scalar("SELECT value FROM system_table WHERE key = ?1")
-            .bind(&key)
-            .fetch_optional(pool)
-            .await?;
-    Ok(v.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
+    let v: Option<String> = sqlx::query_scalar("SELECT value FROM system_table WHERE key = ?1")
+        .bind(&key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(v.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -374,7 +419,9 @@ mod tests {
     #[tokio::test]
     async fn add_task_with_default_filter() {
         let (_d, p) = pool().await;
-        let id = add_task(&p, &task("photos", "bisynchronous")).await.unwrap();
+        let id = add_task(&p, &task("photos", "bisynchronous"))
+            .await
+            .unwrap();
         assert_eq!(id, 1);
         let rule = get_filter_rule_by_task_id(&p, id).await.unwrap().unwrap();
         assert_eq!(rule.ignore_dotfiles, 1);
@@ -411,6 +458,7 @@ mod tests {
             &p,
             id,
             &TaskUpdate {
+                filter_rule: None,
                 name: None,
                 mode: Some("uploadonly".into()),
                 open_cloud: Some(1),
@@ -444,7 +492,8 @@ mod ipc_input_tests {
     fn accepts_official_ui_filter_payload() {
         let input: super::FilterRuleInput = serde_json::from_value(serde_json::json!({
             "ignore_extensions":"lnk,pst,swp", "size_lower_bound":"0", "size_upper_bound":"1048576"
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(input.ignore_extensions, vec!["lnk", "pst", "swp"]);
         assert_eq!(input.size_lower_bound, Some(0));
         assert_eq!(input.size_upper_bound, Some(1048576));
@@ -453,10 +502,14 @@ mod ipc_input_tests {
     fn accepts_native_filter_payload_and_rejects_invalid_numbers() {
         let input: super::FilterRuleInput = serde_json::from_value(serde_json::json!({
             "ignore_extensions":["tmp"], "size_lower_bound":0, "size_upper_bound":null
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(input.ignore_extensions, vec!["tmp"]);
         assert_eq!(input.size_upper_bound, None);
-        assert!(serde_json::from_value::<super::FilterRuleInput>(serde_json::json!({"size_lower_bound":"invalid"})).is_err());
+        assert!(serde_json::from_value::<super::FilterRuleInput>(
+            serde_json::json!({"size_lower_bound":"invalid"})
+        )
+        .is_err());
     }
 }
 
@@ -471,7 +524,50 @@ mod official_create_tests {
                 "enable_size_lower":0,"size_lower_bound":"0","enable_size_upper":0,"size_upper_bound":"0"}});
         let task: super::TaskCreate = serde_json::from_value(input).unwrap();
         assert_eq!(task.open_cloud, 1);
-        let update: super::TaskUpdate = serde_json::from_value(serde_json::json!({"open_cloud":false})).unwrap();
+        let update: super::TaskUpdate =
+            serde_json::from_value(serde_json::json!({"open_cloud":false})).unwrap();
         assert_eq!(update.open_cloud, Some(0));
+    }
+}
+
+#[cfg(test)]
+mod ui_roundtrip_tests {
+    #[test]
+    fn filter_rule_roundtrips_to_ui_string_fields() {
+        let rule = super::FilterRuleInput::default_rule();
+        let output = serde_json::to_value(rule).unwrap();
+        assert!(output["ignore_extensions"].is_string());
+        assert_eq!(
+            output["ignore_extensions"]
+                .as_str()
+                .unwrap()
+                .split(',')
+                .count(),
+            3
+        );
+    }
+    #[tokio::test]
+    async fn task_settings_update_mode_and_filter_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::service::database::open_db(&dir.path().join("db.sqlite"))
+            .await
+            .unwrap();
+        crate::service::database::migrate(&db).await.unwrap();
+        let create: super::TaskCreate = serde_json::from_value(serde_json::json!({"name":"settings", "address":"test", "conn_type":"ip", "uuid":"1", "identifier":"qa", "mode":"bisynchronous", "nas_path":"vol1/1/test", "pc_path":"/tmp/test", "nas_acc_id":0,"open_cloud":false})).unwrap();
+        let id = super::add_task(&db, &create).await.unwrap();
+        let edit:super::TaskUpdate=serde_json::from_value(serde_json::json!({"mode":"downloadonly","filter_rule":{"ignore_extensions":"tmp,bak", "size_lower_bound":"10"},"open_cloud":false})).unwrap();
+        super::update_task(&db, id, &edit).await.unwrap();
+        assert_eq!(
+            super::get_task_by_id(&db, id).await.unwrap().unwrap().mode,
+            "downloadonly"
+        );
+        let rule = super::get_filter_rule_by_task_id(&db, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rule.ignore_extensions, vec!["tmp", "bak"]);
+        assert_eq!(rule.size_lower_bound, Some(10));
+        super::delete_task(&db, id).await.unwrap();
+        assert!(super::get_task_by_id(&db, id).await.unwrap().is_none());
     }
 }

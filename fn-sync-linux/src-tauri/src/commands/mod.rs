@@ -40,7 +40,10 @@ pub async fn get_nas_account_by_id(state: State<'_, AppState>, id: i64) -> Resul
 }
 
 #[tauri::command]
-pub async fn get_nas_account_by_nas_id(state: State<'_, AppState>, nas_id: String) -> Result<Value, String> {
+pub async fn get_nas_account_by_nas_id(
+    state: State<'_, AppState>,
+    nas_id: String,
+) -> Result<Value, String> {
     let acc = nas_account::get_nas_account_by_nas_id(db(&state), &nas_id)
         .await
         .map_err(|e| e.to_string())?;
@@ -70,9 +73,17 @@ pub async fn update_nas_account_by_auth(
     cookie: String,
 ) -> Result<(), String> {
     state.task_manager.lock().await.delete_client(id as u64);
-    nas_account::update_nas_account_by_auth(db(&state), id, &username, &token, &long_token, &secret, &cookie)
-        .await
-        .map_err(|e| e.to_string())
+    nas_account::update_nas_account_by_auth(
+        db(&state),
+        id,
+        &username,
+        &token,
+        &long_token,
+        &secret,
+        &cookie,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -102,7 +113,7 @@ pub async fn update_nas_account_password(
 #[tauri::command]
 pub async fn delete_nas_account(state: State<'_, AppState>, id: i64) -> Result<(), String> {
     // 断开对应客户端
-    state.task_manager.lock().await.disconnect_account(id);
+    state.task_manager.lock().await.disconnect_account(id).await;
     nas_account::delete_nas_account(db(&state), id)
         .await
         .map_err(|e| e.to_string())
@@ -115,23 +126,23 @@ pub async fn add_task(state: State<'_, AppState>, task: TaskCreate) -> Result<i6
     let id = tasks::add_task(db(&state), &task)
         .await
         .map_err(|e| e.to_string())?;
-    // 有账号则立即尝试启动任务
-    if let Ok(Some(acc)) = nas_account::get_nas_account_by_id(db(&state), task.nas_acc_id).await {
-        state.task_manager.lock().await.start_task(&state.db, id, &acc).await
-            .map_err(|e| format!("task {id} saved but failed to start: {e}"))?;
-    }
+    // 官方界面随后提交目录排除列表；收到完整配置后再启动，避免先同步被排除目录。
     Ok(id)
 }
 
 #[tauri::command]
 pub async fn get_all_tasks(state: State<'_, AppState>) -> Result<Value, String> {
-    let t = tasks::get_all_tasks(db(&state)).await.map_err(|e| e.to_string())?;
+    let t = tasks::get_all_tasks(db(&state))
+        .await
+        .map_err(|e| e.to_string())?;
     serde_json::to_value(t).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn get_task_by_id(state: State<'_, AppState>, id: i64) -> Result<Value, String> {
-    let t = tasks::get_task_by_id(db(&state), id).await.map_err(|e| e.to_string())?;
+    let t = tasks::get_task_by_id(db(&state), id)
+        .await
+        .map_err(|e| e.to_string())?;
     serde_json::to_value(t).map_err(|e| e.to_string())
 }
 
@@ -155,19 +166,33 @@ pub async fn get_next_task_id(state: State<'_, AppState>) -> Result<i64, String>
 }
 
 #[tauri::command]
-pub async fn update_task(state: State<'_, AppState>, id: i64, update_data: TaskUpdate) -> Result<(), String> {
-    tasks::update_task(db(&state), id, &update_data).await.map_err(|e| e.to_string())
+pub async fn update_task(
+    state: State<'_, AppState>,
+    id: i64,
+    update_data: TaskUpdate,
+) -> Result<(), String> {
+    tasks::update_task(db(&state), id, &update_data)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn update_task_status(state: State<'_, AppState>, id: i64, status: i64) -> Result<(), String> {
-    tasks::update_task_status(db(&state), id, status).await.map_err(|e| e.to_string())
+pub async fn update_task_status(
+    state: State<'_, AppState>,
+    id: i64,
+    status: i64,
+) -> Result<(), String> {
+    tasks::update_task_status(db(&state), id, status)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn delete_task(state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    state.task_manager.lock().await.stop_task(id);
-    tasks::delete_task(db(&state), id).await.map_err(|e| e.to_string())
+    state.task_manager.lock().await.stop_task(id).await;
+    tasks::delete_task(db(&state), id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -194,7 +219,7 @@ pub async fn resume_task(state: State<'_, AppState>, task_id: i64) -> Result<(),
 
 #[tauri::command]
 pub async fn reload_task(state: State<'_, AppState>, task_id: i64) -> Result<(), String> {
-    state.task_manager.lock().await.stop_task(task_id);
+    state.task_manager.lock().await.stop_task(task_id).await;
     let task = tasks::get_task_by_id(db(&state), task_id)
         .await
         .map_err(|e| e.to_string())?
@@ -203,35 +228,57 @@ pub async fn reload_task(state: State<'_, AppState>, task_id: i64) -> Result<(),
         .await
         .map_err(|e| e.to_string())?
         .ok_or("account not found")?;
-    state.task_manager.lock().await.start_task(&state.db, task_id, &acc).await
+    state
+        .task_manager
+        .lock()
+        .await
+        .start_task(&state.db, task_id, &acc)
+        .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn get_task_status_summary(state: State<'_, AppState>, task_id: i64) -> Result<Value, String> {
+pub async fn get_task_status_summary(
+    state: State<'_, AppState>,
+    task_id: i64,
+) -> Result<Value, String> {
     let task = tasks::get_task_by_id(db(&state), task_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or("task not found")?;
     let running = state.task_manager.lock().await.is_running(task_id);
     Ok(serde_json::json!({
-        "status": task.status,
-        "running": running,
-        "mode": task.mode,
+        "status":task.status, "running":running, "mode":task.mode,
+        "processing_count":i64::from(task.status == crate::tasks::actor::status::SYNCING),
+        "execute_count":i64::from(task.status != crate::tasks::actor::status::PAUSED),
+        "completed_count":i64::from(task.status == crate::tasks::actor::status::COMPLETED)
     }))
 }
 
 #[tauri::command]
 pub async fn get_global_tasks_status(state: State<'_, AppState>) -> Result<Value, String> {
-    let mgr = state.task_manager.lock().await;
+    use crate::tasks::actor::status as st;
+    let all = tasks::get_all_tasks(db(&state))
+        .await
+        .map_err(|e| e.to_string())?;
+    let count = |statuses: &[i64]| all.iter().filter(|t| statuses.contains(&t.status)).count();
     Ok(serde_json::json!({
-        "task_count": mgr.task_count(),
-        "running_count": mgr.running_count(),
+        "task_count":all.len(), "running_count":state.task_manager.lock().await.running_count(),
+        "paused_count":count(&[st::PAUSED]), "connecting_count":count(&[st::INIT]),
+        "account_exception_count":count(&[st::ACCOUNT_ERROR,st::SECURITY_CODE_ERROR]),
+        "permission_exception_count":count(&[st::NAS_NO_PERM,st::NAS_NO_ACL_SUPPORT]),
+        "task_exception_count":count(&[st::FAILED_LOCAL_DIR,st::FAILED_NAS_DIR,st::VERSION_INCORRECT]),
+        "sync_failed_count":count(&[st::FAILED]), "sync_error_count":count(&[st::ERROR]),
+        "processing_count":count(&[st::SYNCING]), "execute_count":all.len()-count(&[st::PAUSED]),
+        "completed_count":count(&[st::COMPLETED,st::IDLE])
     }))
 }
 
 #[tauri::command]
-pub async fn get_filter_rule_by_task_id(state: State<'_, AppState>, task_id: i64) -> Result<Value, String> {
+pub async fn get_filter_rule_by_task_id(
+    state: State<'_, AppState>,
+    task_id: i64,
+) -> Result<Value, String> {
     let rule = tasks::get_filter_rule_by_task_id(db(&state), task_id)
         .await
         .map_err(|e| e.to_string())?;
@@ -246,12 +293,32 @@ pub async fn save_folder_filter_paths(
 ) -> Result<(), String> {
     tasks::save_folder_filter_paths(db(&state), task_id, &folder_paths)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if let Some(task) = tasks::get_task_by_id(db(&state), task_id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        if task.status != crate::tasks::actor::status::PAUSED {
+            if nas_account::get_nas_account_by_id(db(&state), task.nas_acc_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                reload_task(state, task_id).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn get_folder_filter_paths(state: State<'_, AppState>, task_id: i64) -> Result<Vec<String>, String> {
-    tasks::get_folder_filter_paths(db(&state), task_id).await.map_err(|e| e.to_string())
+pub async fn get_folder_filter_paths(
+    state: State<'_, AppState>,
+    task_id: i64,
+) -> Result<Vec<String>, String> {
+    tasks::get_folder_filter_paths(db(&state), task_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -263,36 +330,61 @@ pub async fn validate_app_name(state: State<'_, AppState>, name: String) -> Resu
 // ---------- logs ----------
 
 #[tauri::command]
-pub async fn query_logs(state: State<'_, AppState>, params: GetLogsParams) -> Result<Value, String> {
-    let (rows, total) = logs::query_logs(db(&state), &params).await.map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "data": rows, "total": total }))
+pub async fn query_logs(
+    state: State<'_, AppState>,
+    mut params: GetLogsParams,
+) -> Result<Value, String> {
+    params.page = params.page.saturating_sub(1).max(0);
+    params.page_size = params.page_size.clamp(1, 1000);
+    let (rows, total) = logs::query_logs(db(&state), &params)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "list": rows, "data": rows, "total": total }))
 }
 
 #[tauri::command]
 pub async fn get_logs_by_size(state: State<'_, AppState>, size: i64) -> Result<Value, String> {
-    let rows = logs::get_logs_by_size(db(&state), size).await.map_err(|e| e.to_string())?;
+    let rows = logs::get_logs_by_size(db(&state), size)
+        .await
+        .map_err(|e| e.to_string())?;
     serde_json::to_value(rows).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn clear_all_logs(state: State<'_, AppState>) -> Result<(), String> {
-    logs::clear_all_logs(db(&state)).await.map_err(|e| e.to_string())
+    logs::clear_all_logs(db(&state))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn get_extended_logs(state: State<'_, AppState>) -> Result<Value, String> {
-    let rows = logs::get_logs_by_size(db(&state), 50).await.map_err(|e| e.to_string())?;
+    let rows = logs::get_logs_by_size(db(&state), 50)
+        .await
+        .map_err(|e| e.to_string())?;
     serde_json::to_value(rows).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn get_completed_items(state: State<'_, AppState>, task_id: i64) -> Result<Value, String> {
-    let (rows, _total) = logs::query_logs(db(&state), &GetLogsParams {
-        task_id: Some(task_id),
-        status: Some(logs::STATUS_SUCCESS),
-        start_time: None, end_time: None, keyword: None, action_code: None,
-        page_size: 100, page: 0,
-    }).await.map_err(|e| e.to_string())?;
+pub async fn get_completed_items(
+    state: State<'_, AppState>,
+    task_id: i64,
+) -> Result<Value, String> {
+    let (rows, _total) = logs::query_logs(
+        db(&state),
+        &GetLogsParams {
+            task_id: Some(task_id),
+            status: Some(logs::STATUS_SUCCESS),
+            start_time: None,
+            end_time: None,
+            keyword: None,
+            action_code: None,
+            page_size: 100,
+            page: 0,
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     serde_json::to_value(rows).map_err(|e| e.to_string())
 }
 
@@ -314,25 +406,40 @@ pub async fn get_all_system_table(state: State<'_, AppState>) -> Result<Value, S
 }
 
 #[tauri::command]
-pub async fn update_system_table(state: State<'_, AppState>, key: String, value: String) -> Result<(), String> {
-    logs::set_system_value(db(&state), &key, &value).await.map_err(|e| e.to_string())
+pub async fn update_system_table(
+    state: State<'_, AppState>,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    logs::set_system_value(db(&state), &key, &value)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn get_app_log_dir(state: State<'_, AppState>) -> Result<String, String> {
     let _ = state;
-    crate::platform::app_log_dir().map(|p| p.display().to_string()).map_err(|e| e.to_string())
+    crate::platform::app_log_dir()
+        .map(|p| p.display().to_string())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn export_log_file(_state: State<'_, AppState>) -> Result<String, String> {
-    let _log_dir = crate::platform::app_log_dir().map_err(|e| e.to_string())?;
-    let target = std::env::temp_dir().join("fn-sync-logs.zip");
-    let zip_path = target.display().to_string();
-    // 打包 database.sqlite 与 log 目录
-    let db_path = crate::platform::app_data_dir().map_err(|e| e.to_string())?.join("database.sqlite");
-    let _ = std::fs::copy(&db_path, std::env::temp_dir().join("fn-sync-export-database.sqlite"));
-    Ok(zip_path)
+    let logs = crate::platform::app_log_dir().map_err(|e| e.to_string())?;
+    let target = std::env::temp_dir().join(format!("fn-sync-logs-{}.tar.gz", uuid::Uuid::new_v4()));
+    let status = std::process::Command::new("tar")
+        .arg("-czf")
+        .arg(&target)
+        .arg("-C")
+        .arg(logs)
+        .arg(".")
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("log archive failed".into());
+    }
+    Ok(target.display().to_string())
 }
 
 #[tauri::command]
@@ -366,7 +473,6 @@ pub async fn app_quit(app: tauri::AppHandle) {
 
 #[tauri::command]
 pub async fn app_restart(app: tauri::AppHandle) {
-    
     app.restart();
 }
 
@@ -394,13 +500,14 @@ pub async fn get_traffic_query(state: State<'_, AppState>) -> Result<Value, Stri
     Ok(serde_json::json!({ "tx": tx, "rx": rx }))
 }
 
-
 /// ip 与 host 都是直连 NAS 的 5667 端口，语义相同。
 /// fnid 需要 FN Connect 中继（libtrimcon），当前版本未移植。
 fn ensure_direct_conn(conn_type: &str) -> Result<(), String> {
     match conn_type {
         "ip" | "host" | "" => Ok(()),
-        "fnid" => Err("fnid_not_supported: FN ID 连接需要 FN Connect 中继，请改用 IP 或域名连接".into()),
+        "fnid" => {
+            Err("fnid_not_supported: FN ID 连接需要 FN Connect 中继，请改用 IP 或域名连接".into())
+        }
         other => Err(format!("unsupported connection type: {other}")),
     }
 }
@@ -409,15 +516,25 @@ fn ensure_direct_conn(conn_type: &str) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn connect_nas(state: State<'_, AppState>, config: Value) -> Result<i64, String> {
-    let conn_type = config.get("conn_type").and_then(|v| v.as_str()).unwrap_or("ip");
-    let address = config.get("address").and_then(|v| v.as_str()).unwrap_or_default();
+    let conn_type = config
+        .get("conn_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ip");
+    let address = config
+        .get("address")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     ensure_direct_conn(conn_type)?;
     check_trim_address_inner(&state, conn_type, address).await?;
     // 校验通过后由前端走 OAuth 流程；此处返回占位账号 id
     Ok(-1)
 }
 
-async fn check_trim_address_inner(state: &State<'_, AppState>, conn_type: &str, address: &str) -> Result<(), String> {
+async fn check_trim_address_inner(
+    state: &State<'_, AppState>,
+    conn_type: &str,
+    address: &str,
+) -> Result<(), String> {
     let _ = state;
     ensure_direct_conn(conn_type)?;
     let addr = if address.contains(':') {
@@ -451,7 +568,10 @@ pub async fn check_trim_address(
 }
 
 #[tauri::command]
-pub async fn query_nas_os_edition(state: State<'_, AppState>, address: String) -> Result<Value, String> {
+pub async fn query_nas_os_edition(
+    state: State<'_, AppState>,
+    address: String,
+) -> Result<Value, String> {
     let _ = &state;
     let (host, ver) = crate::connect::nas_client::NasClient::probe(&address)
         .await
@@ -466,13 +586,20 @@ pub async fn create_nas_client(
     address: String,
 ) -> Result<u64, String> {
     ensure_direct_conn(&conn_type)?;
-    state.task_manager.lock().await.create_client(&address)
+    state
+        .task_manager
+        .lock()
+        .await
+        .create_client(&address)
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn delete_nas_client(state: State<'_, AppState>, connection_id: u64) -> Result<(), String> {
+pub async fn delete_nas_client(
+    state: State<'_, AppState>,
+    connection_id: u64,
+) -> Result<(), String> {
     state.task_manager.lock().await.delete_client(connection_id);
     Ok(())
 }
@@ -484,19 +611,40 @@ pub async fn send_message_from_connection_id(
     message: Value,
 ) -> Result<Value, String> {
     let acc = nas_account::get_nas_account_by_id(db(&state), connection_id as i64)
-        .await.map_err(|e| e.to_string())?;
+        .await
+        .map_err(|e| e.to_string())?;
     if let Some(acc) = acc {
-        let client = state.task_manager.lock().await.account_client(&acc)
-            .await.map_err(|e| { tracing::warn!(account_id = acc.id, error = %e, "session restore failed"); e.to_string() })?;
+        let client = state
+            .task_manager
+            .lock()
+            .await
+            .account_client(&acc)
+            .await
+            .map_err(|e| {
+                tracing::warn!(account_id = acc.id, error = %e, "session restore failed");
+                e.to_string()
+            })?;
         return client.rpc(message).await.map_err(|e| e.to_string());
     }
-    state.task_manager.lock().await.send_rpc(connection_id, message).await.map_err(|e| e.to_string())
+    state
+        .task_manager
+        .lock()
+        .await
+        .send_rpc(connection_id, message)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn get_addr_type(state: State<'_, AppState>, conn_type: String, address: String) -> Result<String, String> {
+pub async fn get_addr_type(
+    state: State<'_, AppState>,
+    conn_type: String,
+    address: String,
+) -> Result<String, String> {
     let _ = (state, &conn_type);
-    if address.parse::<std::net::Ipv4Addr>().is_ok() || address.contains(':') && !address.contains("fnos") {
+    if address.parse::<std::net::Ipv4Addr>().is_ok()
+        || address.contains(':') && !address.contains("fnos")
+    {
         Ok("lan".into())
     } else {
         Ok("p2p".into())
@@ -509,41 +657,57 @@ pub async fn validate_task_nas_dir_exists(
     task_id: i64,
     nas_path: Option<String>,
 ) -> Result<bool, String> {
-    let task = tasks::get_task_by_id(db(&state), task_id).await.map_err(|e|e.to_string())?
+    let task = tasks::get_task_by_id(db(&state), task_id)
+        .await
+        .map_err(|e| e.to_string())?
         .ok_or("task not found")?;
-    let acc = nas_account::get_nas_account_by_id(db(&state), task.nas_acc_id).await.map_err(|e|e.to_string())?
+    let acc = nas_account::get_nas_account_by_id(db(&state), task.nas_acc_id)
+        .await
+        .map_err(|e| e.to_string())?
         .ok_or("account not found")?;
-    let client = state.task_manager.lock().await.account_client(&acc).await.map_err(|e|e.to_string())?;
+    let client = state
+        .task_manager
+        .lock()
+        .await
+        .account_client(&acc)
+        .await
+        .map_err(|e| e.to_string())?;
     let reply = client.rpc(serde_json::json!({"req":"file.ls", "path":nas_path.as_deref().unwrap_or(&task.nas_path).trim_start_matches('/')}))
         .await.map_err(|e|e.to_string())?;
-    Ok(reply.get("files").and_then(|v|v.as_array()).is_some())
+    Ok(reply.get("files").and_then(|v| v.as_array()).is_some())
 }
 
 #[tauri::command]
-pub async fn is_path_sync_root_command(state: State<'_, AppState>, path: String) -> Result<bool, String> {
-    let all = tasks::get_all_tasks(db(&state)).await.map_err(|e|e.to_string())?;
+pub async fn is_path_sync_root_command(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<bool, String> {
+    let all = tasks::get_all_tasks(db(&state))
+        .await
+        .map_err(|e| e.to_string())?;
     let path = std::path::Path::new(&path);
     Ok(all.iter().any(|t| path == std::path::Path::new(&t.pc_path)))
 }
 
 #[tauri::command]
-pub async fn is_external_device_path(state: State<'_, AppState>, path: String) -> Result<bool, String> {
+pub async fn is_external_device_path(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<bool, String> {
     let _ = state;
     // Linux: /media/* /run/media/* /mnt/* 视为外置设备
     Ok(path.starts_with("/media/") || path.starts_with("/run/media/") || path.starts_with("/mnt/"))
 }
 
 #[tauri::command]
-pub async fn cmd_set_first_login_state(state: State<'_, AppState>, nas_acc_id: i64) -> Result<(), String> {
-    crate::service::logs::set_system_value(
-        db(&state),
-        &format!("first_login_{nas_acc_id}"),
-        "1",
-    )
-    .await
-    .map_err(|e| e.to_string())
+pub async fn cmd_set_first_login_state(
+    state: State<'_, AppState>,
+    nas_acc_id: i64,
+) -> Result<(), String> {
+    crate::service::logs::set_system_value(db(&state), &format!("first_login_{nas_acc_id}"), "1")
+        .await
+        .map_err(|e| e.to_string())
 }
-
 
 /// 授权窗口启动脚本：探测 Tauri 环境并回传结果到 Rust 日志。
 /// NAS 前端用 `label === "async-oauth"` 与 `__TAURI_INTERNALS__` 判定是否走
@@ -611,7 +775,11 @@ pub async fn open_oauth_window(
     let _ = account_id;
 
     let addr = url.trim().trim_end_matches('/').to_string();
-    let addr = if addr.contains(':') { addr } else { format!("{addr}:5667") };
+    let addr = if addr.contains(':') {
+        addr
+    } else {
+        format!("{addr}:5667")
+    };
 
     // —— 与官方客户端一致：本机起 axum 代理，窗口加载 NAS 自己的 /login ——
     // NAS 前端检测到 Tauri 环境后会直接 invoke("put_auth_result", {data})，
@@ -663,12 +831,15 @@ pub async fn open_oauth_window(
     Ok(())
 }
 
-
 /// 授权窗 IPC 桥的实现（供 oauth_proxy 调用，避免 AppHandle 传递复杂化）
 pub fn oauth_put_auth_result(app: &tauri::AppHandle, data: Value) -> Result<(), String> {
-    use tauri::{Manager, Emitter};
-    app.state::<AppState>().last_auth_result.lock().replace(data.clone());
-    app.emit("oauth-result", serde_json::json!({"code": 0, "data": data})).map_err(|e| e.to_string())?;
+    use tauri::{Emitter, Manager};
+    app.state::<AppState>()
+        .last_auth_result
+        .lock()
+        .replace(data.clone());
+    app.emit("oauth-result", serde_json::json!({"code": 0, "data": data}))
+        .map_err(|e| e.to_string())?;
     // 官方行为：授权完成后关闭授权窗口
     if let Some(w) = app.get_webview_window("async-oauth") {
         let _ = w.close();
@@ -700,31 +871,61 @@ pub async fn put_auth_result(
     // OAuth 窗口回传: token/long_token/secret/cookie/uid/username/machine_id/nas_id...
     use tauri::Emitter;
     state.last_auth_result.lock().replace(data.clone());
-    app.emit("oauth-result", serde_json::json!({"code": 0, "data": data})).map_err(|e| e.to_string())?;
+    app.emit("oauth-result", serde_json::json!({"code": 0, "data": data}))
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn connect_nas_by_auth(state: State<'_, AppState>, config: Value) -> Result<i64, String> {
-    let conn_type = config.get("conn_type").and_then(|v| v.as_str()).unwrap_or("ip");
-    let address = config.get("address").and_then(|v| v.as_str()).unwrap_or_default();
-    let username = config.get("username").and_then(|v| v.as_str()).unwrap_or_default();
-    let token = config.get("token").and_then(|v| v.as_str()).unwrap_or_default();
-    let long_token = config.get("long_token").and_then(|v| v.as_str()).unwrap_or_default();
-    let secret = config.get("secret").and_then(|v| v.as_str()).unwrap_or_default();
-    let cookie = config.get("cookie").and_then(|v| v.as_str()).unwrap_or_default();
+    let conn_type = config
+        .get("conn_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ip");
+    let address = config
+        .get("address")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let username = config
+        .get("username")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let token = config
+        .get("token")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let long_token = config
+        .get("long_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let secret = config
+        .get("secret")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let cookie = config
+        .get("cookie")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     let uid = config.get("uid").and_then(|v| v.as_i64()).unwrap_or(0);
-    let machine_id = config.get("machine_id").and_then(|v| v.as_str()).unwrap_or_default();
+    let machine_id = config
+        .get("machine_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
 
     ensure_direct_conn(conn_type)?;
 
     // 先尝试连通 + 拉取 NAS 信息
-    let (nas_name, _fnos_version) = state.task_manager.lock().await
+    let (nas_name, _fnos_version) = state
+        .task_manager
+        .lock()
+        .await
         .probe_nas(&address)
         .await
         .map_err(|e| e.to_string())?;
 
-    let nas_id = config.get("nas_id").and_then(|v| v.as_str())
+    let nas_id = config
+        .get("nas_id")
+        .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| machine_id.to_string());
 
@@ -745,7 +946,9 @@ pub async fn connect_nas_by_auth(state: State<'_, AppState>, config: Value) -> R
         fnos_version: String::new(),
         cookie: cookie.to_string(),
     };
-    nas_account::add_nas_account(db(&state), &acc).await.map_err(|e| e.to_string())
+    nas_account::add_nas_account(db(&state), &acc)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// 直接用用户名/密码登录 NAS（与官方客户端 user.login 流程一致）。
@@ -776,9 +979,10 @@ pub async fn login_nas(
     let token = client.token.read().clone();
     let machine_id = client.machine_id.read().clone();
 
-    let existing = nas_account::get_nas_account_by_address_and_username(db(&state), &addr, &username)
-        .await
-        .map_err(|e| e.to_string())?;
+    let existing =
+        nas_account::get_nas_account_by_address_and_username(db(&state), &addr, &username)
+            .await
+            .map_err(|e| e.to_string())?;
 
     if let Some(acc) = existing {
         nas_account::update_nas_account_password(db(&state), acc.id, &password)
@@ -791,9 +995,17 @@ pub async fn login_nas(
     }
 
     let acc = NasAccountCreate {
-        nas_id: if machine_id.is_empty() { addr.clone() } else { machine_id.clone() },
+        nas_id: if machine_id.is_empty() {
+            addr.clone()
+        } else {
+            machine_id.clone()
+        },
         uid,
-        nas_name: if host.is_empty() { format!("NAS ({ver})") } else { host },
+        nas_name: if host.is_empty() {
+            format!("NAS ({ver})")
+        } else {
+            host
+        },
         address: addr,
         username,
         conn_type: "ip".into(),
@@ -807,11 +1019,15 @@ pub async fn login_nas(
         fnos_version: ver,
         cookie: String::new(),
     };
-    nas_account::add_nas_account(db(&state), &acc).await.map_err(|e| e.to_string())
+    nas_account::add_nas_account(db(&state), &acc)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 fn hostname() -> Option<String> {
-    std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 // ---------- mDNS 发现 ----------
@@ -922,7 +1138,8 @@ mod oauth_parse_tests {
 
     #[test]
     fn detects_credential_query() {
-        let u = tauri::Url::parse("https://nas.local:5667/c/oauth/callback?token=abc&uid=1").unwrap();
+        let u =
+            tauri::Url::parse("https://nas.local:5667/c/oauth/callback?token=abc&uid=1").unwrap();
         assert!(looks_like_oauth_callback(&u));
     }
 
@@ -947,10 +1164,8 @@ mod oauth_parse_tests {
 
     #[test]
     fn extracts_json_fragment() {
-        let u = tauri::Url::parse(
-            "https://nas:5667/cb#{%22token%22:%22tok%22,%22uid%22:%223%22}",
-        )
-        .unwrap();
+        let u = tauri::Url::parse("https://nas:5667/cb#{%22token%22:%22tok%22,%22uid%22:%223%22}")
+            .unwrap();
         let v = extract_oauth_payload(&u).unwrap();
         assert_eq!(v["token"], "tok");
         assert_eq!(v["uid"], "3");
@@ -1003,23 +1218,112 @@ fn read_layer(root: &std::path::Path, parent_rel: &str) -> Vec<FolderNode> {
             format!("{}/{}", parent_rel.trim_matches('/'), name)
         };
         let has_child = std::fs::read_dir(&path)
-            .map(|mut it| it.any(|e| {
-                e.as_ref()
-                    .map(|x| x.path().is_dir()
-                        && !x.file_name().to_string_lossy().starts_with('.'))
-                    .unwrap_or(false)
-            }))
+            .map(|mut it| {
+                it.any(|e| {
+                    e.as_ref()
+                        .map(|x| {
+                            x.path().is_dir() && !x.file_name().to_string_lossy().starts_with('.')
+                        })
+                        .unwrap_or(false)
+                })
+            })
             .unwrap_or(false);
         out.push(FolderNode {
             relative_path: rel.clone(),
             parent_relative_path: parent_rel.to_string(),
             name,
-            child_existence: if has_child { "has_children".into() } else { "no_children".into() },
+            child_existence: if has_child {
+                "has_children".into()
+            } else {
+                "no_children".into()
+            },
             is_dir: true,
         });
     }
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     out
+}
+
+async fn folder_layer(
+    state: &AppState,
+    account_id: i64,
+    pc_path: &str,
+    nas_path: &str,
+    mode: &str,
+    parent: &str,
+) -> Result<Vec<FolderNode>, String> {
+    if std::path::Path::new(parent).components().any(|c| {
+        !matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        return Err("invalid relative folder path".into());
+    }
+    let mut nodes = std::collections::BTreeMap::new();
+    if mode != "downloadonly" {
+        for node in read_layer(std::path::Path::new(pc_path), parent) {
+            nodes.insert(node.name.clone(), node);
+        }
+    }
+    if mode != "uploadonly" {
+        let acc = nas_account::get_nas_account_by_id(&state.db, account_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("account not found")?;
+        let nas = state
+            .task_manager
+            .lock()
+            .await
+            .account_client(&acc)
+            .await
+            .map_err(|e| e.to_string())?;
+        let base = if parent.is_empty() {
+            nas_path.trim_matches('/').to_string()
+        } else {
+            format!("{}/{}", nas_path.trim_matches('/'), parent)
+        };
+        for entry in nas
+            .ls(&base)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|e| e.is_dir())
+        {
+            let rel = if parent.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{parent}/{}", entry.name)
+            };
+            let has_children = nas
+                .ls(&format!("{base}/{}", entry.name))
+                .await
+                .map_err(|e| e.to_string())?
+                .iter()
+                .any(|e| e.is_dir());
+            let node = FolderNode {
+                relative_path: rel,
+                parent_relative_path: parent.into(),
+                name: entry.name.clone(),
+                child_existence: if has_children {
+                    "has_children"
+                } else {
+                    "no_children"
+                }
+                .into(),
+                is_dir: true,
+            };
+            nodes
+                .entry(entry.name)
+                .and_modify(|old| {
+                    if has_children {
+                        old.child_existence = "has_children".into();
+                    }
+                })
+                .or_insert(node);
+        }
+    }
+    Ok(nodes.into_values().collect())
 }
 
 #[tauri::command]
@@ -1031,19 +1335,26 @@ pub async fn cmd_get_folder_list(
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "task not found".to_string())?;
-    Ok(read_layer(std::path::Path::new(&task.pc_path), ""))
+    folder_layer(
+        &state,
+        task.nas_acc_id,
+        &task.pc_path,
+        &task.nas_path,
+        &task.mode,
+        "",
+    )
+    .await
 }
 
 #[tauri::command]
 pub async fn cmd_get_folder_list_with_params(
     state: State<'_, AppState>,
-    _nas_acc_id: i64,
+    nas_acc_id: i64,
     pc_path: String,
-    _nas_path: String,
-    _mode: String,
+    nas_path: String,
+    mode: String,
 ) -> Result<Vec<FolderNode>, String> {
-    let _ = &state;
-    Ok(read_layer(std::path::Path::new(&pc_path), ""))
+    folder_layer(&state, nas_acc_id, &pc_path, &nas_path, &mode, "").await
 }
 
 #[tauri::command]
@@ -1056,26 +1367,35 @@ pub async fn cmd_get_folder_layer(
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "task not found".to_string())?;
-    Ok(read_layer(
-        std::path::Path::new(&task.pc_path),
+    folder_layer(
+        &state,
+        task.nas_acc_id,
+        &task.pc_path,
+        &task.nas_path,
+        &task.mode,
         &parent_relative_path,
-    ))
+    )
+    .await
 }
 
 #[tauri::command]
 pub async fn cmd_get_folder_layer_with_params(
     state: State<'_, AppState>,
-    _nas_acc_id: i64,
+    nas_acc_id: i64,
     pc_path: String,
-    _nas_path: String,
-    _mode: String,
+    nas_path: String,
+    mode: String,
     parent_relative_path: String,
 ) -> Result<Vec<FolderNode>, String> {
-    let _ = &state;
-    Ok(read_layer(
-        std::path::Path::new(&pc_path),
+    folder_layer(
+        &state,
+        nas_acc_id,
+        &pc_path,
+        &nas_path,
+        &mode,
         &parent_relative_path,
-    ))
+    )
+    .await
 }
 
 /// 取指定字段为空的节点（官方用于诊断，Linux 版无 file_map 表 → 空集）
@@ -1092,10 +1412,14 @@ pub async fn get_nodes_with_null_field(
 
 #[tauri::command]
 pub async fn clear_all_data_by_task_id(
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
     task_id: i64,
 ) -> Result<(), String> {
-    let _ = task_id;
+    sqlx::query("DELETE FROM system_table WHERE key=?1")
+        .bind(format!("sync_snapshot_{task_id}"))
+        .execute(db(&state))
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1131,15 +1455,20 @@ pub async fn get_tasks_id_and_status_by_nas_acc_id(
 pub async fn edit_open_cloud(
     state: State<'_, AppState>,
     task_id: i64,
-    open_cloud: i64,
+    open_cloud: bool,
 ) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if open_cloud {
+        return Err("Linux 暂不支持按需同步，请使用普通同步".into());
+    }
     tasks::update_task(
         db(&state),
         task_id,
         &TaskUpdate {
+            filter_rule: None,
             name: None,
             mode: None,
-            open_cloud: Some(open_cloud),
+            open_cloud: Some(i64::from(open_cloud)),
         },
     )
     .await
@@ -1148,9 +1477,7 @@ pub async fn edit_open_cloud(
 
 #[tauri::command]
 pub async fn renew_task(state: State<'_, AppState>, task_id: i64) -> Result<(), String> {
-    let mgr = state.task_manager.lock().await;
-    mgr.stop_task(task_id);
-    Ok(())
+    reload_task(state, task_id).await
 }
 
 #[tauri::command]
@@ -1167,19 +1494,22 @@ pub async fn network_restart(state: State<'_, AppState>, task_id: i64) -> Result
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "nas account not found".to_string())?;
-    let mut mgr = state.task_manager.lock().await;
-    mgr.stop_task(task_id);
+    let mgr = state.task_manager.lock().await;
+    mgr.stop_task(task_id).await;
+    mgr.delete_client(acc_id as u64);
     mgr.start_task(db(&state), task_id, &account)
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn remove_tasks_from_map(
-    state: State<'_, AppState>,
-    task_id: i64,
-) -> Result<(), String> {
-    state.task_manager.lock().await.stop_task(task_id);
+pub async fn remove_tasks_from_map(state: State<'_, AppState>, task_id: i64) -> Result<(), String> {
+    state
+        .task_manager
+        .lock()
+        .await
+        .disconnect_account(task_id)
+        .await;
     Ok(())
 }
 
@@ -1190,7 +1520,10 @@ pub async fn add_log(state: State<'_, AppState>, log: Value) -> Result<(), Strin
         is_dir: log.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false),
         name: log.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
         path: log.get("path").and_then(|v| v.as_str()).unwrap_or_default(),
-        sync_folder: log.get("sync_folder").and_then(|v| v.as_str()).unwrap_or_default(),
+        sync_folder: log
+            .get("sync_folder")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
         action_code: log.get("action_code").and_then(|v| v.as_i64()).unwrap_or(0),
         status: log.get("status").and_then(|v| v.as_i64()).unwrap_or(0),
         failed_code: log.get("failed_code").and_then(|v| v.as_i64()).unwrap_or(0),
@@ -1211,7 +1544,10 @@ pub async fn check_oauth_security_code(
     // 从回调 URL 中提取安全码参数（官方用于二次校验）
     let code = url
         .split(['?', '&'])
-        .find_map(|kv| kv.strip_prefix("code=").or_else(|| kv.strip_prefix("security_code=")))
+        .find_map(|kv| {
+            kv.strip_prefix("code=")
+                .or_else(|| kv.strip_prefix("security_code="))
+        })
         .unwrap_or_default()
         .to_string();
     Ok(serde_json::json!({ "code": code, "valid": !code.is_empty() }))
@@ -1307,11 +1643,24 @@ pub async fn send_message_from_temp_conn(
 ) -> Result<Value, String> {
     let _ = reqid;
     ensure_direct_conn(&conn_type)?;
-    let address = if address.contains(':') { address } else { format!("{address}:5667") };
-    let acc = nas_account::get_all_nas_accounts(db(&state)).await.map_err(|e| e.to_string())?
-        .into_iter().find(|a| a.address == address)
+    let address = if address.contains(':') {
+        address
+    } else {
+        format!("{address}:5667")
+    };
+    let acc = nas_account::get_all_nas_accounts(db(&state))
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|a| a.address == address)
         .ok_or("no saved NAS account for this address")?;
-    let client = state.task_manager.lock().await.account_client(&acc).await.map_err(|e| e.to_string())?;
+    let client = state
+        .task_manager
+        .lock()
+        .await
+        .account_client(&acc)
+        .await
+        .map_err(|e| e.to_string())?;
     client.rpc(message).await.map_err(|e| e.to_string())
 }
 

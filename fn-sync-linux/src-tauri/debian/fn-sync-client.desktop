@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=飞牛同步
+Name[en]=FN Sync
+Comment=与 fnOS NAS 同步文件
+Comment[en]=Sync files with fnOS NAS
+Exec=fn-sync-client
+Icon=fn-sync-client
+Terminal=false
+Categories=Network;FileTransfer;Utility;
+StartupWMClass=fn-sync-client

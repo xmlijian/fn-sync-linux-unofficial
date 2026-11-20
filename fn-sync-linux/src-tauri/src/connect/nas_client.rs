@@ -19,7 +19,7 @@ use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
@@ -47,6 +47,8 @@ impl NasConnConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RemoteEntry {
+    #[serde(skip)]
+    pub revision: String,
     pub name: String,
     /// 服务端返回 1/0 或 true/false
     #[serde(default, deserialize_with = "de_dir")]
@@ -55,6 +57,8 @@ pub struct RemoteEntry {
     pub size: u64,
     #[serde(default)]
     pub mtim: i64,
+    #[serde(default)]
+    pub btim: i64,
     #[serde(default)]
     pub uid: i64,
 }
@@ -78,6 +82,16 @@ impl RemoteEntry {
     }
 }
 
+struct PendingReply {
+    pending: Arc<DashMap<String, oneshot::Sender<Value>>>,
+    id: String,
+}
+impl Drop for PendingReply {
+    fn drop(&mut self) {
+        self.pending.remove(&self.id);
+    }
+}
+
 pub struct NasClient {
     pub conn_id: u64,
     config: NasConnConfig,
@@ -88,7 +102,16 @@ pub struct NasClient {
     tx: mpsc::Sender<(Option<String>, String, oneshot::Sender<Value>)>,
     pending: Arc<DashMap<String, oneshot::Sender<Value>>>,
     req_seq: AtomicU64,
+    connected: Arc<AtomicBool>,
+    writer_abort: tokio::task::AbortHandle,
+    reader_abort: tokio::task::AbortHandle,
     http: reqwest::Client,
+}
+
+impl Drop for NasClient {
+    fn drop(&mut self) {
+        self.disconnect();
+    }
 }
 
 impl NasClient {
@@ -149,12 +172,17 @@ impl NasClient {
         let (tx, mut rx) = mpsc::channel::<(Option<String>, String, oneshot::Sender<Value>)>(256);
         let pending: Arc<DashMap<String, oneshot::Sender<Value>>> = Arc::new(DashMap::new());
 
+        let connected = Arc::new(AtomicBool::new(true));
         // 写任务
         let pending_w = pending.clone();
-        tokio::spawn(async move {
+        let connected_w = connected.clone();
+        let writer = tokio::spawn(async move {
             while let Some((reqid, text, reply)) = rx.recv().await {
                 match reqid {
                     Some(id) => {
+                        if reply.is_closed() {
+                            continue;
+                        }
                         pending_w.insert(id, reply);
                     }
                     None => drop(reply),
@@ -163,11 +191,14 @@ impl NasClient {
                     break;
                 }
             }
+            connected_w.store(false, Ordering::Relaxed);
+            pending_w.clear();
         });
 
         // 读任务：按 reqid 派发
         let pending_r = pending.clone();
-        tokio::spawn(async move {
+        let connected_r = connected.clone();
+        let reader = tokio::spawn(async move {
             while let Some(Ok(msg)) = src.next().await {
                 let text = match msg {
                     Message::Text(t) => t.to_string(),
@@ -189,8 +220,9 @@ impl NasClient {
                     }
                 }
                 // 服务端推送不能作为任何一个 RPC 的响应。
-
             }
+            connected_r.store(false, Ordering::Relaxed);
+            pending_r.clear();
         });
 
         let client = Arc::new(Self {
@@ -207,9 +239,23 @@ impl NasClient {
             tx,
             pending,
             req_seq: AtomicU64::new(1),
+            connected,
+            writer_abort: writer.abort_handle(),
+            reader_abort: reader.abort_handle(),
         });
 
         Ok(client)
+    }
+
+    pub fn disconnect(&self) {
+        self.connected.store(false, Ordering::Relaxed);
+        self.pending.clear();
+        self.writer_abort.abort();
+        self.reader_abort.abort();
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed) && !self.tx.is_closed()
     }
 
     fn next_reqid(&self) -> String {
@@ -221,17 +267,19 @@ impl NasClient {
         format!("{ts:012x}{n:08x}")
     }
 
-    async fn send_wait(
-        &self,
-        reqid: &str,
-        text: String,
-        timeout: Duration,
-    ) -> Result<Value> {
+    async fn send_wait(&self, reqid: &str, text: String, timeout: Duration) -> Result<Value> {
+        if !self.is_connected() {
+            return Err(anyhow!("NAS connection closed"));
+        }
         let (otx, orx) = oneshot::channel();
         self.tx
             .send((Some(reqid.to_string()), text, otx))
             .await
             .map_err(|_| anyhow!("ws closed"))?;
+        let _pending_reply = PendingReply {
+            pending: self.pending.clone(),
+            id: reqid.to_string(),
+        };
         match tokio::time::timeout(timeout, orx).await {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(_)) => Err(anyhow!("ws reply dropped")),
@@ -263,20 +311,31 @@ impl NasClient {
     }
 
     /// 从 OAuth 保存的会话恢复连接，不需要保存用户密码。
-    pub async fn restore_session(&self, acc: &crate::service::nas_account::NasAccount) -> Result<()> {
+    pub async fn restore_session(
+        &self,
+        acc: &crate::service::nas_account::NasAccount,
+    ) -> Result<()> {
         use base64::Engine;
-        let key = base64::engine::general_purpose::STANDARD.decode(&acc.secret)
+        let key = base64::engine::general_purpose::STANDARD
+            .decode(&acc.secret)
             .map_err(|_| anyhow!("invalid saved session secret"))?;
-        if key.is_empty() || acc.token.is_empty() { return Err(anyhow!("saved session missing credentials")); }
+        if key.is_empty() || acc.token.is_empty() {
+            return Err(anyhow!("saved session missing credentials"));
+        }
         *self.key.write() = key;
         *self.uid.write() = acc.uid;
         *self.token.write() = acc.token.clone();
         *self.machine_id.write() = acc.nas_id.clone();
         let si = self.rpc_plain(json!({"req":"util.getSI"})).await?;
-        let reply = self.rpc(json!({"req":"user.authToken", "token":acc.token,
-            "si":si.get("si").and_then(|v|v.as_str()).unwrap_or_default()})).await?;
-        if reply.get("result").and_then(|v|v.as_str()) != Some("succ") {
-            return Err(anyhow!("session authentication failed (code: {})", reply.get("code").unwrap_or(&Value::Null)));
+        let reply = self
+            .rpc(json!({"req":"user.authToken", "token":acc.token,
+            "si":si.get("si").and_then(|v|v.as_str()).unwrap_or_default()}))
+            .await?;
+        if reply.get("result").and_then(|v| v.as_str()) != Some("succ") {
+            return Err(anyhow!(
+                "session authentication failed (code: {})",
+                reply.get("code").unwrap_or(&Value::Null)
+            ));
         }
         Ok(())
     }
@@ -333,7 +392,9 @@ impl NasClient {
             .get("secret")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("login: no secret"))?;
-        let secret_ct = b.decode(secret_b64).map_err(|e| anyhow!("secret b64: {e}"))?;
+        let secret_ct = b
+            .decode(secret_b64)
+            .map_err(|e| anyhow!("secret b64: {e}"))?;
         let key = crypto::aes_cbc_decrypt(&key_str, &iv, &secret_ct)?;
         *self.key.write() = key;
 
@@ -350,39 +411,78 @@ impl NasClient {
     // ---------------- 文件 API ----------------
     pub async fn ls_dir(&self) -> Result<Vec<RemoteEntry>> {
         let r = self.rpc(json!({ "req": "file.lsDir" })).await?;
-        Ok(parse_entries(&r))
+        if r.get("result").and_then(|v| v.as_str()) == Some("fail") {
+            return Err(anyhow!(
+                "directory query failed (errno: {})",
+                r.get("errno").unwrap_or(&Value::Null)
+            ));
+        }
+        parse_entries(&r)
     }
 
     pub async fn ls(&self, path: &str) -> Result<Vec<RemoteEntry>> {
         let r = self.rpc(json!({ "req": "file.ls", "path": path })).await?;
-        Ok(parse_entries(&r))
+        if r.get("result").and_then(|v| v.as_str()) == Some("fail") {
+            return Err(anyhow!(
+                "directory query failed (errno: {})",
+                r.get("errno").unwrap_or(&Value::Null)
+            ));
+        }
+        parse_entries(&r)
     }
 
     pub async fn mkdir(&self, path: &str) -> Result<()> {
-        let r = self.rpc(json!({ "req": "file.mkdir", "path": path })).await?;
+        let r = self
+            .rpc(json!({ "req": "file.mkdir", "path": path }))
+            .await?;
         if r.get("result").and_then(|v| v.as_str()) == Some("fail") {
             let errno = r.get("errno").and_then(|v| v.as_i64()).unwrap_or(0);
-            // 已存在不算失败
-            if errno != 4362 {
-                return Err(anyhow!("mkdir failed: {r}"));
+            let _ = errno;
+            if let Some((parent, name)) = path.trim_end_matches('/').rsplit_once('/') {
+                if self
+                    .ls(parent)
+                    .await?
+                    .iter()
+                    .any(|entry| entry.name == name && entry.is_dir())
+                {
+                    return Ok(());
+                }
             }
+            return Err(anyhow!("mkdir failed: {r}"));
         }
         Ok(())
     }
 
     pub async fn remove(&self, paths: Vec<String>) -> Result<()> {
-        let r = self
-            .rpc(json!({ "req": "file.rm", "files": paths, "moveToTrashbin": false }))
-            .await?;
-        if r.get("result").and_then(|v| v.as_str()) == Some("fail") {
-            return Err(anyhow!("rm failed: {r}"));
-        }
-        Ok(())
+        let operation = self.rpc(json!({"req":"file.rm", "files":paths, "moveToTrashbin":false}));
+        tokio::pin!(operation);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut replied = false;
+            loop {
+                tokio::select! {
+                    result = &mut operation, if !replied => {
+                        replied = true;
+                        let r = result?;
+                        if r.get("result").and_then(|v|v.as_str()) == Some("fail") {
+                            return Err(anyhow!("remove failed (errno: {})",r.get("errno").unwrap_or(&Value::Null)));
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        let mut gone = true;
+                        for path in &paths {
+                            let (parent, name) = path.trim_end_matches('/').rsplit_once('/').ok_or_else(||anyhow!("invalid removal path"))?;
+                            if self.ls(parent).await?.iter().any(|e|e.name == name) { gone = false; break; }
+                        }
+                        if gone { return Ok(()); }
+                    }
+                }
+            }
+        }).await.map_err(|_|anyhow!("remove completion timeout"))?
     }
 
     pub async fn rename(&self, path: &str, new_name: &str) -> Result<()> {
         let r = self
-            .rpc(json!({ "req": "file.rename", "path": path, "name": new_name }))
+            .rpc(json!({ "req": "file.rename", "path": path, "newName": new_name }))
             .await?;
         if r.get("result").and_then(|v| v.as_str()) == Some("fail") {
             return Err(anyhow!("rename failed: {r}"));
@@ -392,24 +492,37 @@ impl NasClient {
 
     /// 递归列出远端目录（用于轮询比对）。
     pub async fn remote_tree(&self, root: &str) -> Result<Vec<(String, RemoteEntry)>> {
+        self.remote_tree_filtered(root, None).await
+    }
+
+    pub async fn remote_tree_filtered(
+        &self,
+        root: &str,
+        filter: Option<&crate::tasks::file_filter::FileFilter>,
+    ) -> Result<Vec<(String, RemoteEntry)>> {
         let mut out = Vec::new();
         let mut stack = vec![(root.trim_matches('/').to_string(), String::new())];
         let mut guard = 0;
         while let Some((dir, rel)) = stack.pop() {
             guard += 1;
             if guard > 20000 {
-                break;
+                return Err(anyhow!("remote directory limit exceeded"));
             }
-            let entries = match self.ls(&dir).await {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+            let entries = self.ls(&dir).await?;
             for e in entries {
                 let child_rel = if rel.is_empty() {
                     e.name.clone()
                 } else {
                     format!("{rel}/{}", e.name)
                 };
+                if filter
+                    .map(|f| {
+                        !f.should_sync(&child_rel, if e.is_dir() { None } else { Some(e.size) })
+                    })
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 if e.is_dir() {
                     stack.push((format!("{dir}/{}", e.name), child_rel.clone()));
                 }
@@ -435,11 +548,20 @@ impl NasClient {
         if !resp.status().is_success() {
             return Err(anyhow!("download http {}", resp.status()));
         }
-        Ok(resp.bytes().await?.to_vec())
+        let mut stream = resp.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            crate::traffic::throttle(chunk.len(), false).await;
+            bytes.extend_from_slice(&chunk);
+        }
+        crate::traffic::TrafficCounter::new().add(0, bytes.len() as i64);
+        Ok(bytes)
     }
 
     // ---------------- 上传 ----------------
     pub async fn upload(&self, remote: &str, data: Vec<u8>, mtime: Option<i64>) -> Result<()> {
+        let transfer_size = data.len() as i64;
         let overwrite = true;
         let ck = self
             .rpc(json!({
@@ -471,9 +593,21 @@ impl NasClient {
         });
         let token = self.token.read().clone();
 
-        let part = reqwest::multipart::Part::bytes(data)
-            .file_name(upload_name.clone())
-            .mime_str("application/octet-stream")?;
+        let stream = futures_util::stream::unfold((data, 0usize), |(data, offset)| async move {
+            if offset >= data.len() {
+                return None;
+            }
+            let end = (offset + 64 * 1024).min(data.len());
+            let chunk = data[offset..end].to_vec();
+            crate::traffic::throttle(chunk.len(), true).await;
+            Some((Ok::<_, std::io::Error>(chunk), (data, end)))
+        });
+        let part = reqwest::multipart::Part::stream_with_length(
+            reqwest::Body::wrap_stream(stream),
+            transfer_size as u64,
+        )
+        .file_name(upload_name.clone())
+        .mime_str("application/octet-stream")?;
         let form = reqwest::multipart::Form::new().part("trim-upload-file", part);
 
         let mut req = self
@@ -495,19 +629,30 @@ impl NasClient {
             let text = resp.text().await.unwrap_or_default();
             return Err(anyhow!("upload http {status}: {text}"));
         }
+        crate::traffic::TrafficCounter::new().add(transfer_size, 0);
         Ok(())
     }
 }
 
-fn parse_entries(v: &Value) -> Vec<RemoteEntry> {
-    v.get("files")
-        .and_then(|f| f.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|e| serde_json::from_value::<RemoteEntry>(e.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default()
+fn parse_entries(v: &Value) -> Result<Vec<RemoteEntry>> {
+    let Some(files) = v.get("files") else {
+        return Ok(Vec::new());
+    };
+    let mut entries: Vec<RemoteEntry> = serde_json::from_value(files.clone())
+        .map_err(|e| anyhow!("invalid directory entries: {e}"))?;
+    let revision = v.get("uver").map(|v| v.to_string()).unwrap_or_default();
+    for e in &mut entries {
+        e.revision = revision.clone();
+        if e.name.is_empty()
+            || e.name == "."
+            || e.name == ".."
+            || e.name.contains('/')
+            || e.name.contains('\\')
+        {
+            return Err(anyhow!("invalid remote entry name"));
+        }
+    }
+    Ok(entries)
 }
 
 /// 与 JS `encodeURI` 一致：保留 `/` 与 `-_.!~*'()`。
@@ -516,7 +661,10 @@ fn encode_uri_path(path: &str) -> String {
     for b in path.bytes() {
         let c = b as char;
         let keep = c.is_ascii_alphanumeric()
-            || matches!(c, '/' | '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')');
+            || matches!(
+                c,
+                '/' | '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')'
+            );
         if keep {
             out.push(c);
         } else {
@@ -544,7 +692,8 @@ pub fn skip_verify_config() -> Result<rustls::ClientConfig> {
             _server_name: &rustls::pki_types::ServerName<'_>,
             _ocsp: &[u8],
             _now: rustls::pki_types::UnixTime,
-        ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error>
+        {
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         }
         fn verify_tls12_signature(
@@ -587,4 +736,75 @@ pub fn skip_verify_config() -> Result<rustls::ClientConfig> {
         .with_no_client_auth();
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod live_transfer_tests {
+    #[tokio::test]
+    #[ignore = "requires saved NAS session and isolated FN_SYNC_TEST_REMOTE_ROOT"]
+    async fn nas_upload_download_rename_delete() {
+        let db = crate::service::database::open_db(std::path::Path::new(
+            &std::env::var("FN_SYNC_TEST_DB").unwrap(),
+        ))
+        .await
+        .unwrap();
+        let address = std::env::var("FN_SYNC_TEST_ADDRESS").unwrap();
+        let acc = crate::service::nas_account::get_all_nas_accounts(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.address == address)
+            .unwrap();
+        let manager = crate::task_manager::TaskManager::new();
+        let nas = manager.account_client(&acc).await.unwrap();
+        let root = std::env::var("FN_SYNC_TEST_REMOTE_ROOT").unwrap();
+        assert!(root.contains("fn-sync-qa-"));
+        let path = format!("{root}/中文上传.txt");
+        struct ResetLimits;
+        impl Drop for ResetLimits {
+            fn drop(&mut self) {
+                crate::traffic::set_limit("global_upload_speed_limit", "-1");
+                crate::traffic::set_limit("global_download_speed_limit", "-1");
+            }
+        }
+        let _reset = ResetLimits;
+        let bytes = vec![b'Q'; 4096];
+        crate::traffic::set_limit("global_upload_speed_limit", "64");
+        let started = std::time::Instant::now();
+        nas.upload(&path, bytes.clone(), None)
+            .await
+            .expect("upload");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(50),
+            "upload bandwidth setting ignored"
+        );
+        crate::traffic::set_limit("global_upload_speed_limit", "-1");
+        let listing = nas.ls(&root).await.expect("listing");
+        assert!(
+            listing.iter().any(|e| e.name == "中文上传.txt"),
+            "uploaded file missing from parsed listing"
+        );
+        crate::traffic::set_limit("global_download_speed_limit", "64");
+        let started = std::time::Instant::now();
+        assert_eq!(nas.download(&path).await.expect("download"), bytes);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(50),
+            "download bandwidth setting ignored"
+        );
+        crate::traffic::set_limit("global_download_speed_limit", "-1");
+        nas.rename(&path, "renamed.txt").await.expect("rename");
+        assert_eq!(
+            nas.download(&format!("{root}/renamed.txt")).await.unwrap(),
+            bytes
+        );
+        nas.remove(vec![format!("{root}/renamed.txt")])
+            .await
+            .expect("delete");
+        assert!(!nas
+            .ls(&root)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.name == "renamed.txt"));
+    }
 }

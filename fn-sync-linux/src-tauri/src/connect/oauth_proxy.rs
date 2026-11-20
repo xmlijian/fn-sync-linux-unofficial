@@ -32,7 +32,11 @@ pub struct OauthProxy {
 
 impl OauthProxy {
     /// 在随机端口启动代理，指向给定的 NAS。
-    pub async fn start(nas_addr: &str, verify_tls: bool, app: Option<tauri::AppHandle>) -> Result<Self> {
+    pub async fn start(
+        nas_addr: &str,
+        verify_tls: bool,
+        app: Option<tauri::AppHandle>,
+    ) -> Result<Self> {
         let nas_base = if nas_addr.starts_with("http") {
             nas_addr.to_string()
         } else {
@@ -108,12 +112,8 @@ fn rewrite_location(value: &str, nas_base: &str, local_base: &str) -> String {
     // NAS 返回的绝对 302 要改回本地代理，避免 webview 直接跳出代理
     value
         .replace(nas_base, local_base)
-        .replace(
-            &nas_base.replace("https://", "http://"),
-            local_base,
-        )
+        .replace(&nas_base.replace("https://", "http://"), local_base)
 }
-
 
 /// 授权窗口的 IPC 桥。
 ///
@@ -182,7 +182,9 @@ async fn proxy_handler(State(st): State<ProxyState>, req: Request) -> Response {
     let uri = req.uri().clone();
     let local_base = format!(
         "http://127.0.0.1:{}",
-        uri.authority().map(|a| a.as_str()).unwrap_or_default()
+        uri.authority()
+            .map(|a| a.as_str())
+            .unwrap_or_default()
             .rsplit(':')
             .next()
             .unwrap_or_default()
@@ -203,7 +205,10 @@ async fn proxy_handler(State(st): State<ProxyState>, req: Request) -> Response {
         headers.insert(k.clone(), v.clone());
     }
     // HTML 需要在 NAS 模块执行前注入授权桥，要求上游返回未压缩内容。
-    headers.insert(HeaderName::from_static("accept-encoding"), HeaderValue::from_static("identity"));
+    headers.insert(
+        HeaderName::from_static("accept-encoding"),
+        HeaderValue::from_static("identity"),
+    );
     // 与官方一致：代理请求带 cookie: mode=relay
     {
         let existing = headers
@@ -239,7 +244,7 @@ async fn proxy_handler(State(st): State<ProxyState>, req: Request) -> Response {
         Method::HEAD => reqwest::Method::HEAD,
         Method::OPTIONS => reqwest::Method::OPTIONS,
         Method::PATCH => reqwest::Method::PATCH,
-    _ => return (StatusCode::METHOD_NOT_ALLOWED, "method").into_response(),
+        _ => return (StatusCode::METHOD_NOT_ALLOWED, "method").into_response(),
     };
 
     let mut rb = st.client.request(method_conv, &target).headers(headers);
@@ -252,11 +257,7 @@ async fn proxy_handler(State(st): State<ProxyState>, req: Request) -> Response {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(url = %target, error = %e, "oauth proxy upstream failed");
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("upstream {target}: {e}"),
-            )
-                .into_response();
+            return (StatusCode::BAD_GATEWAY, format!("upstream {target}: {e}")).into_response();
         }
     };
 
@@ -269,7 +270,9 @@ async fn proxy_handler(State(st): State<ProxyState>, req: Request) -> Response {
         let mut val = v.clone();
         if k.as_str().eq_ignore_ascii_case("location") {
             if let Ok(s) = v.to_str() {
-                if let Ok(nv) = HeaderValue::from_str(&rewrite_location(s, &st.nas_base, &local_base)) {
+                if let Ok(nv) =
+                    HeaderValue::from_str(&rewrite_location(s, &st.nas_base, &local_base))
+                {
                     val = nv;
                 }
             }
@@ -277,12 +280,18 @@ async fn proxy_handler(State(st): State<ProxyState>, req: Request) -> Response {
         out_headers.insert(k.clone(), val);
     }
 
-    let is_js = resp.headers().get("content-type")
+    let is_js = resp
+        .headers()
+        .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.contains("javascript")).unwrap_or(false);
-    let is_html = resp.headers().get("content-type")
+        .map(|v| v.contains("javascript"))
+        .unwrap_or(false);
+    let is_html = resp
+        .headers()
+        .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.starts_with("text/html")).unwrap_or(false);
+        .map(|v| v.starts_with("text/html"))
+        .unwrap_or(false);
     let body = match resp.bytes().await {
         Ok(body) => body,
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("upstream body: {e}")).into_response(),
@@ -290,17 +299,27 @@ async fn proxy_handler(State(st): State<ProxyState>, req: Request) -> Response {
     let body = if is_html {
         match std::str::from_utf8(&body) {
             Ok(html) => inject_oauth_bridge(html).into_bytes(),
-            Err(_) => return (StatusCode::BAD_GATEWAY, "invalid upstream HTML encoding").into_response(),
+            Err(_) => {
+                return (StatusCode::BAD_GATEWAY, "invalid upstream HTML encoding").into_response()
+            }
         }
     } else if is_js {
         match std::str::from_utf8(&body) {
-            Ok(js) => js.replace("window.__TAURI_INTERNALS__?.invoke(`get_device_id`)",
-                "window.__FN_OAUTH_BRIDGE__.invoke(`get_device_id`)")
-                .replace("window.__TAURI_INTERNALS__?.invoke(`put_auth_result`,{data:e})",
-                "window.__FN_OAUTH_BRIDGE__.invoke(`put_auth_result`,{data:e})").into_bytes(),
+            Ok(js) => js
+                .replace(
+                    "window.__TAURI_INTERNALS__?.invoke(`get_device_id`)",
+                    "window.__FN_OAUTH_BRIDGE__.invoke(`get_device_id`)",
+                )
+                .replace(
+                    "window.__TAURI_INTERNALS__?.invoke(`put_auth_result`,{data:e})",
+                    "window.__FN_OAUTH_BRIDGE__.invoke(`put_auth_result`,{data:e})",
+                )
+                .into_bytes(),
             Err(_) => body.to_vec(),
         }
-    } else { body.to_vec() };
+    } else {
+        body.to_vec()
+    };
     let mut builder = Response::builder().status(status.as_u16());
     if let Some(hs) = builder.headers_mut() {
         *hs = out_headers;
@@ -386,8 +405,7 @@ async fn proxy_websocket(st: ProxyState, req: Request) -> Response {
         match crate::connect::nas_client::skip_verify_config() {
             Ok(c) => c,
             Err(e) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("tls: {e}"))
-                    .into_response()
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("tls: {e}")).into_response()
             }
         },
     )) {
@@ -395,28 +413,26 @@ async fn proxy_websocket(st: ProxyState, req: Request) -> Response {
     };
 
     tracing::info!(url = %ws_url, "oauth ws upstream connecting");
-    let upstream = match tokio_tungstenite::connect_async_tls_with_config(creq, None, false, tls).await
-    {
-        Ok((ws, _)) => ws,
-        Err(e) => {
-            tracing::error!(url = %ws_url, error = %e, "ws upstream failed");
-            return (StatusCode::BAD_GATEWAY, format!("ws upstream: {e}")).into_response();
-        }
-    };
+    let upstream =
+        match tokio_tungstenite::connect_async_tls_with_config(creq, None, false, tls).await {
+            Ok((ws, _)) => ws,
+            Err(e) => {
+                tracing::error!(url = %ws_url, error = %e, "ws upstream failed");
+                return (StatusCode::BAD_GATEWAY, format!("ws upstream: {e}")).into_response();
+            }
+        };
 
     let (mut up_tx, mut up_rx) = upstream.split();
 
     use axum::extract::FromRequestParts;
     let mut parts_owned = parts;
-    let ws = match <WebSocketUpgrade as FromRequestParts<()>>::from_request_parts(
-        &mut parts_owned,
-        &(),
-    )
-    .await
-    {
-        Ok(u) => u,
-        Err(r) => return r.into_response(),
-    };
+    let ws =
+        match <WebSocketUpgrade as FromRequestParts<()>>::from_request_parts(&mut parts_owned, &())
+            .await
+        {
+            Ok(u) => u,
+            Err(r) => return r.into_response(),
+        };
 
     ws.on_upgrade(move |socket| async move {
         let (mut cl_tx, mut cl_rx) = socket.split();
@@ -424,12 +440,18 @@ async fn proxy_websocket(st: ProxyState, req: Request) -> Response {
         let fwd_up = async {
             while let Some(Ok(msg)) = cl_rx.next().await {
                 let out = match msg {
-                    AxMsg::Text(t) => tokio_tungstenite::tungstenite::Message::Text(t.to_string().into()),
+                    AxMsg::Text(t) => {
+                        tokio_tungstenite::tungstenite::Message::Text(t.to_string().into())
+                    }
                     AxMsg::Binary(b) => {
                         tokio_tungstenite::tungstenite::Message::Binary(b.to_vec().into())
                     }
-                    AxMsg::Ping(p) => tokio_tungstenite::tungstenite::Message::Ping(p.to_vec().into()),
-                    AxMsg::Pong(p) => tokio_tungstenite::tungstenite::Message::Pong(p.to_vec().into()),
+                    AxMsg::Ping(p) => {
+                        tokio_tungstenite::tungstenite::Message::Ping(p.to_vec().into())
+                    }
+                    AxMsg::Pong(p) => {
+                        tokio_tungstenite::tungstenite::Message::Pong(p.to_vec().into())
+                    }
                     AxMsg::Close(_) => break,
                 };
                 if up_tx.send(out).await.is_err() {
@@ -441,12 +463,18 @@ async fn proxy_websocket(st: ProxyState, req: Request) -> Response {
         let fwd_down = async {
             while let Some(Ok(msg)) = up_rx.next().await {
                 let out = match msg {
-                    tokio_tungstenite::tungstenite::Message::Text(t) => AxMsg::Text(t.to_string().into()),
+                    tokio_tungstenite::tungstenite::Message::Text(t) => {
+                        AxMsg::Text(t.to_string().into())
+                    }
                     tokio_tungstenite::tungstenite::Message::Binary(b) => {
                         AxMsg::Binary(b.to_vec().into())
                     }
-                    tokio_tungstenite::tungstenite::Message::Ping(p) => AxMsg::Ping(p.to_vec().into()),
-                    tokio_tungstenite::tungstenite::Message::Pong(p) => AxMsg::Pong(p.to_vec().into()),
+                    tokio_tungstenite::tungstenite::Message::Ping(p) => {
+                        AxMsg::Ping(p.to_vec().into())
+                    }
+                    tokio_tungstenite::tungstenite::Message::Pong(p) => {
+                        AxMsg::Pong(p.to_vec().into())
+                    }
                     tokio_tungstenite::tungstenite::Message::Close(_) => break,
                     _ => continue,
                 };

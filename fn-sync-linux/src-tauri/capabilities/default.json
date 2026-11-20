@@ -1,0 +1,35 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "官方前端所需的 Tauri 核心与插件权限",
+  "windows": [
+    "*"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-focus",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-unminimize",
+    "core:window:allow-is-maximized",
+    "core:window:allow-maximize",
+    "core:window:allow-unmaximize",
+    "core:webview:default",
+    "core:app:default",
+    "dialog:default",
+    "opener:default",
+    "autostart:default",
+    "mdns:default",
+    "mdns:allow-browse-many",
+    "mdns:allow-stop-browse"
+  ],
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:*",
+      "http://localhost:*"
+    ]
+  }
+}
