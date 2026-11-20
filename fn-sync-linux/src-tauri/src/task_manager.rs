@@ -129,18 +129,19 @@ impl TaskManager {
             .await?;
 
         let (local_tx, local_rx) = mpsc::channel(4096);
-        let watcher = crate::tasks::watch::LocalWatcher::start(
-            std::path::PathBuf::from(&task.pc_path),
-            filter.clone(),
-            local_tx,
-        )?;
+
 
         let actor = Arc::new(crate::tasks::actor::TaskActor::new(
             task.clone(),
             nas,
             db.clone(),
-            filter,
+            filter.clone(),
         )?);
+        let watcher = crate::tasks::watch::LocalWatcher::start(
+            std::path::PathBuf::from(&task.pc_path),
+            filter.clone(),
+            local_tx,
+        )?;
         crate::service::tasks::update_task_status(db, task_id, crate::tasks::actor::status::SYNCING)
             .await?;
 

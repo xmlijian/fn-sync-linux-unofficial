@@ -184,8 +184,12 @@ pub async fn resume_task(state: State<'_, AppState>, task_id: i64) -> Result<(),
     tasks::update_task_status(db(&state), task_id, crate::tasks::actor::status::SYNCING)
         .await
         .map_err(|e| e.to_string())?;
-    state.task_manager.lock().await.resume_task(task_id);
-    Ok(())
+    if state.task_manager.lock().await.is_running(task_id) {
+        state.task_manager.lock().await.resume_task(task_id);
+        Ok(())
+    } else {
+        reload_task(state, task_id).await
+    }
 }
 
 #[tauri::command]
@@ -505,9 +509,14 @@ pub async fn validate_task_nas_dir_exists(
     task_id: i64,
     nas_path: String,
 ) -> Result<bool, String> {
-    let _ = (state, task_id, nas_path);
-    // 联调阶段：占位 true；接入 file.ls 后校验
-    Ok(true)
+    let task = tasks::get_task_by_id(db(&state), task_id).await.map_err(|e|e.to_string())?
+        .ok_or("task not found")?;
+    let acc = nas_account::get_nas_account_by_id(db(&state), task.nas_acc_id).await.map_err(|e|e.to_string())?
+        .ok_or("account not found")?;
+    let client = state.task_manager.lock().await.account_client(&acc).await.map_err(|e|e.to_string())?;
+    let reply = client.rpc(serde_json::json!({"req":"file.ls", "path":nas_path.trim_start_matches('/')}))
+        .await.map_err(|e|e.to_string())?;
+    Ok(reply.get("files").and_then(|v|v.as_array()).is_some())
 }
 
 #[tauri::command]
