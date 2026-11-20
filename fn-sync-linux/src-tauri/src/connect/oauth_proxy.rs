@@ -202,6 +202,8 @@ async fn proxy_handler(State(st): State<ProxyState>, req: Request) -> Response {
         }
         headers.insert(k.clone(), v.clone());
     }
+    // HTML 需要在 NAS 模块执行前注入授权桥，要求上游返回未压缩内容。
+    headers.insert(HeaderName::from_static("accept-encoding"), HeaderValue::from_static("identity"));
     // 与官方一致：代理请求带 cookie: mode=relay
     {
         let existing = headers
@@ -275,7 +277,19 @@ async fn proxy_handler(State(st): State<ProxyState>, req: Request) -> Response {
         out_headers.insert(k.clone(), val);
     }
 
-    let body = resp.bytes().await.unwrap_or_default();
+    let is_html = resp.headers().get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.starts_with("text/html")).unwrap_or(false);
+    let body = match resp.bytes().await {
+        Ok(body) => body,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("upstream body: {e}")).into_response(),
+    };
+    let body = if is_html {
+        match std::str::from_utf8(&body) {
+            Ok(html) => inject_oauth_bridge(html).into_bytes(),
+            Err(_) => return (StatusCode::BAD_GATEWAY, "invalid upstream HTML encoding").into_response(),
+        }
+    } else { body.to_vec() };
     let mut builder = Response::builder().status(status.as_u16());
     if let Some(hs) = builder.headers_mut() {
         *hs = out_headers;
@@ -436,4 +450,26 @@ async fn proxy_websocket(st: ProxyState, req: Request) -> Response {
         }
     })
     .into_response()
+}
+
+// 页面初始化脚本可能被 WebKit/Tauri 自己的初始化覆盖；在 HTML 中、模块之前
+// 再安装桥接，保证 NAS 在首次导入 constants 时就能识别 async-oauth。
+fn inject_oauth_bridge(html: &str) -> String {
+    let script = format!("<script>{}</script>", crate::commands::PROBE_SCRIPT);
+    if let Some(pos) = html.to_ascii_lowercase().find("<head>") {
+        let pos = pos + "<head>".len();
+        format!("{}{}{}", &html[..pos], script, &html[pos..])
+    } else {
+        format!("{script}{html}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn bridge_precedes_nas_modules() {
+        let html = super::inject_oauth_bridge("<!doctype html><html><head><script type=\"module\" src=\"/app.js\"></script></head></html>");
+        assert!(html.find("__TAURI_INTERNALS__").unwrap() < html.find("type=\"module\"").unwrap());
+        assert!(html.starts_with("<!doctype html>"));
+    }
 }
