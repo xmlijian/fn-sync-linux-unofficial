@@ -561,14 +561,14 @@ pub(crate) const PROBE_SCRIPT: &str = r#"
       });
     }
   };
-  Object.defineProperty(window, '__TAURI_INTERNALS__', {
+  Object.defineProperty(window, '__FN_OAUTH_BRIDGE__', {
     configurable: true,
     writable: true,
     value: INTERNALS
   });
   function probe() {
     try {
-      window.__TAURI_INTERNALS__.invoke('get_device_id', {});
+      window.__FN_OAUTH_BRIDGE__.invoke('get_device_id', {});
     } catch (e) {}
     console.log('OAUTH_BRIDGE ' + JSON.stringify({
       href: location.href,
@@ -621,11 +621,14 @@ pub async fn open_oauth_window(
     let builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(target))
         .title("登录授权")
         .inner_size(460.0, 660.0)
-        .initialization_script(PROBE_SCRIPT);
+        .initialization_script(PROBE_SCRIPT)
+        .devtools(true);
 
     let win = builder
         .build()
         .map_err(|e| format!("oauth window build failed: {e}"))?;
+
+    win.open_devtools();
 
     // NAS 页面是 http://127.0.0.1（经代理），无自签证书问题。
     // 但页面内若加载 NAS 绝对地址的静态资源，仍需要 TLS 豁免。

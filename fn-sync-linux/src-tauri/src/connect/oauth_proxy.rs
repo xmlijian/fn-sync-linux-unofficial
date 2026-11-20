@@ -277,6 +277,9 @@ async fn proxy_handler(State(st): State<ProxyState>, req: Request) -> Response {
         out_headers.insert(k.clone(), val);
     }
 
+    let is_js = resp.headers().get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("javascript")).unwrap_or(false);
     let is_html = resp.headers().get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(|v| v.starts_with("text/html")).unwrap_or(false);
@@ -288,6 +291,14 @@ async fn proxy_handler(State(st): State<ProxyState>, req: Request) -> Response {
         match std::str::from_utf8(&body) {
             Ok(html) => inject_oauth_bridge(html).into_bytes(),
             Err(_) => return (StatusCode::BAD_GATEWAY, "invalid upstream HTML encoding").into_response(),
+        }
+    } else if is_js {
+        match std::str::from_utf8(&body) {
+            Ok(js) => js.replace("window.__TAURI_INTERNALS__?.invoke(`get_device_id`)",
+                "window.__FN_OAUTH_BRIDGE__.invoke(`get_device_id`)")
+                .replace("window.__TAURI_INTERNALS__?.invoke(`put_auth_result`,{data:e})",
+                "window.__FN_OAUTH_BRIDGE__.invoke(`put_auth_result`,{data:e})").into_bytes(),
+            Err(_) => body.to_vec(),
         }
     } else { body.to_vec() };
     let mut builder = Response::builder().status(status.as_u16());
