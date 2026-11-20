@@ -507,29 +507,30 @@ pub async fn get_addr_type(state: State<'_, AppState>, conn_type: String, addres
 pub async fn validate_task_nas_dir_exists(
     state: State<'_, AppState>,
     task_id: i64,
-    nas_path: String,
+    nas_path: Option<String>,
 ) -> Result<bool, String> {
     let task = tasks::get_task_by_id(db(&state), task_id).await.map_err(|e|e.to_string())?
         .ok_or("task not found")?;
     let acc = nas_account::get_nas_account_by_id(db(&state), task.nas_acc_id).await.map_err(|e|e.to_string())?
         .ok_or("account not found")?;
     let client = state.task_manager.lock().await.account_client(&acc).await.map_err(|e|e.to_string())?;
-    let reply = client.rpc(serde_json::json!({"req":"file.ls", "path":nas_path.trim_start_matches('/')}))
+    let reply = client.rpc(serde_json::json!({"req":"file.ls", "path":nas_path.as_deref().unwrap_or(&task.nas_path).trim_start_matches('/')}))
         .await.map_err(|e|e.to_string())?;
     Ok(reply.get("files").and_then(|v|v.as_array()).is_some())
 }
 
 #[tauri::command]
-pub async fn is_path_sync_root_command(state: State<'_, AppState>, pc_path: String) -> Result<bool, String> {
-    let _ = (state, pc_path);
-    Ok(false)
+pub async fn is_path_sync_root_command(state: State<'_, AppState>, path: String) -> Result<bool, String> {
+    let all = tasks::get_all_tasks(db(&state)).await.map_err(|e|e.to_string())?;
+    let path = std::path::Path::new(&path);
+    Ok(all.iter().any(|t| path == std::path::Path::new(&t.pc_path)))
 }
 
 #[tauri::command]
-pub async fn is_external_device_path(state: State<'_, AppState>, pc_path: String) -> Result<bool, String> {
+pub async fn is_external_device_path(state: State<'_, AppState>, path: String) -> Result<bool, String> {
     let _ = state;
     // Linux: /media/* /run/media/* /mnt/* 视为外置设备
-    Ok(pc_path.starts_with("/media/") || pc_path.starts_with("/run/media/") || pc_path.starts_with("/mnt/"))
+    Ok(path.starts_with("/media/") || path.starts_with("/run/media/") || path.starts_with("/mnt/"))
 }
 
 #[tauri::command]
