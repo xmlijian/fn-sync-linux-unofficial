@@ -92,9 +92,9 @@ pub async fn update_nas_conn_type_by_id(
 pub async fn update_nas_account_password(
     state: State<'_, AppState>,
     id: i64,
-    secret_data: String,
+    password: String,
 ) -> Result<(), String> {
-    nas_account::update_nas_account_password(db(&state), id, &secret_data)
+    nas_account::update_nas_account_password(db(&state), id, &password)
         .await
         .map_err(|e| e.to_string())
 }
