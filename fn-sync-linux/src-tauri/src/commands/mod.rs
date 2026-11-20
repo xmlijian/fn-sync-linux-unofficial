@@ -69,6 +69,7 @@ pub async fn update_nas_account_by_auth(
     secret: String,
     cookie: String,
 ) -> Result<(), String> {
+    state.task_manager.lock().await.delete_client(id as u64);
     nas_account::update_nas_account_by_auth(db(&state), id, &username, &token, &long_token, &secret, &cookie)
         .await
         .map_err(|e| e.to_string())
@@ -81,6 +82,7 @@ pub async fn update_nas_conn_type_by_id(
     conn_type: String,
     address: String,
 ) -> Result<(), String> {
+    state.task_manager.lock().await.delete_client(id as u64);
     nas_account::update_nas_conn_type_by_id(db(&state), id, &conn_type, &address)
         .await
         .map_err(|e| e.to_string())
@@ -115,7 +117,8 @@ pub async fn add_task(state: State<'_, AppState>, task: TaskCreate) -> Result<i6
         .map_err(|e| e.to_string())?;
     // 有账号则立即尝试启动任务
     if let Ok(Some(acc)) = nas_account::get_nas_account_by_id(db(&state), task.nas_acc_id).await {
-        let _ = state.task_manager.lock().await.start_task(&state.db, id, &acc).await;
+        state.task_manager.lock().await.start_task(&state.db, id, &acc).await
+            .map_err(|e| format!("task {id} saved but failed to start: {e}"))?;
     }
     Ok(id)
 }
@@ -476,10 +479,14 @@ pub async fn send_message_from_connection_id(
     connection_id: u64,
     message: Value,
 ) -> Result<Value, String> {
-    state.task_manager.lock().await
-        .send_rpc(connection_id, message)
-        .await
-        .map_err(|e| e.to_string())
+    let acc = nas_account::get_nas_account_by_id(db(&state), connection_id as i64)
+        .await.map_err(|e| e.to_string())?;
+    if let Some(acc) = acc {
+        let client = state.task_manager.lock().await.account_client(&acc)
+            .await.map_err(|e| { tracing::warn!(account_id = acc.id, error = %e, "session restore failed"); e.to_string() })?;
+        return client.rpc(message).await.map_err(|e| e.to_string());
+    }
+    state.task_manager.lock().await.send_rpc(connection_id, message).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1288,18 +1295,13 @@ pub async fn send_message_from_temp_conn(
     message: Value,
     reqid: Option<String>,
 ) -> Result<Value, String> {
-    let _ = (conn_type, reqid);
-    let client = {
-        let mgr = state.task_manager.lock().await;
-        let address = if address.contains(':') {
-            address.clone()
-        } else {
-            format!("{address}:5667")
-        };
-        mgr.create_authed_client(&address, &String::new(), &String::new())
-            .await
-            .map_err(|e| e.to_string())?
-    };
+    let _ = reqid;
+    ensure_direct_conn(&conn_type)?;
+    let address = if address.contains(':') { address } else { format!("{address}:5667") };
+    let acc = nas_account::get_all_nas_accounts(db(&state)).await.map_err(|e| e.to_string())?
+        .into_iter().find(|a| a.address == address)
+        .ok_or("no saved NAS account for this address")?;
+    let client = state.task_manager.lock().await.account_client(&acc).await.map_err(|e| e.to_string())?;
     client.rpc(message).await.map_err(|e| e.to_string())
 }
 

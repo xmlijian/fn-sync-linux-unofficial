@@ -1,0 +1,590 @@
+//! NAS 客户端 —— 基于实测还原的主 RPC 通道。
+//!
+//! 通道：`wss://<host>:5667/websocket?type=main`
+//! 消息：认证后每帧为 `base64(HMAC-SHA256(key, json)) + json`
+//!
+//! 登录：RSA-PKCS1v15 + AES-256-CBC 混合加密（见 `crypto`），
+//! 响应中的 `secret` 再用同一 AES 密钥解密得到 16 字节 HMAC 密钥。
+//!
+//! 文件传输：
+//!   - 下载：RPC `file.download{files:[path]}` → `download[0].uri` → GET
+//!   - 上传：RPC `file.checkUpload{size,path,overwrite}` → `uploadName`
+//!           → POST `/upload` (Trim-* 头 + multipart `trim-upload-file`)
+
+use super::crypto;
+use anyhow::{anyhow, Result};
+use base64::Engine;
+use dashmap::DashMap;
+use futures_util::{SinkExt, StreamExt};
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, oneshot};
+use tokio_tungstenite::connect_async_tls_with_config;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::Message;
+
+const WS_PATH: &str = "/websocket?type=main";
+static CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone)]
+pub struct NasConnConfig {
+    pub address: String, // host:port
+    pub user: String,
+    pub password: String,
+    pub device_name: String,
+    pub verify_tls: bool,
+}
+
+impl NasConnConfig {
+    pub fn host(&self) -> &str {
+        self.address.trim_end_matches('/')
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RemoteEntry {
+    pub name: String,
+    /// 服务端返回 1/0 或 true/false
+    #[serde(default, deserialize_with = "de_dir")]
+    pub dir: bool,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub mtim: i64,
+    #[serde(default)]
+    pub uid: i64,
+}
+
+fn de_dir<'de, D>(d: D) -> std::result::Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let v = Option::<Value>::deserialize(d)?;
+    Ok(match v {
+        Some(Value::Bool(b)) => b,
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+        _ => false,
+    })
+}
+
+impl RemoteEntry {
+    pub fn is_dir(&self) -> bool {
+        self.dir
+    }
+}
+
+pub struct NasClient {
+    pub conn_id: u64,
+    config: NasConnConfig,
+    key: RwLock<Vec<u8>>,
+    pub uid: RwLock<i64>,
+    pub token: RwLock<String>,
+    pub machine_id: RwLock<String>,
+    tx: mpsc::Sender<(Option<String>, String, oneshot::Sender<Value>)>,
+    pending: Arc<DashMap<String, oneshot::Sender<Value>>>,
+    req_seq: AtomicU64,
+    http: reqwest::Client,
+}
+
+impl NasClient {
+    pub fn config(&self) -> &NasConnConfig {
+        &self.config
+    }
+
+    /// 建立 WS + 完成登录。
+    pub async fn connect(config: NasConnConfig) -> Result<Arc<Self>> {
+        let client = Self::open(config).await?;
+        client.login().await?;
+        Ok(client)
+    }
+
+    /// 连通性探测（不登录）：GET 主机名与 NAS 版本。
+    pub async fn probe(address: &str) -> Result<(String, String)> {
+        let config = NasConnConfig {
+            address: address.to_string(),
+            user: String::new(),
+            password: String::new(),
+            device_name: "PcSync".into(),
+            verify_tls: false,
+        };
+        let client = Self::open(config).await?;
+        let r = client
+            .rpc_plain(json!({ "req": "appcgi.sysinfo.getHostName" }))
+            .await?;
+        let host = r
+            .get("data")
+            .and_then(|d| d.get("hostName"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let ver = r
+            .get("data")
+            .and_then(|d| d.get("trimVersion"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        Ok((host, ver))
+    }
+
+    /// 仅建立 WS（不登录）。
+    pub async fn open(config: NasConnConfig) -> Result<Arc<Self>> {
+        let url = format!("wss://{}{}", config.host(), WS_PATH);
+        let mut request = url
+            .clone()
+            .into_client_request()
+            .map_err(|e| anyhow!("ws request: {e}"))?;
+        request
+            .headers_mut()
+            .insert("cookie", "mode=relay".parse().unwrap());
+
+        let tls = Some(tls_config(&config)?);
+        let (stream, _) = connect_async_tls_with_config(request, None, false, tls).await?;
+
+        let (mut sink, mut src) = stream.split();
+        let (tx, mut rx) = mpsc::channel::<(Option<String>, String, oneshot::Sender<Value>)>(256);
+        let pending: Arc<DashMap<String, oneshot::Sender<Value>>> = Arc::new(DashMap::new());
+
+        // 写任务
+        let pending_w = pending.clone();
+        tokio::spawn(async move {
+            while let Some((reqid, text, reply)) = rx.recv().await {
+                match reqid {
+                    Some(id) => {
+                        pending_w.insert(id, reply);
+                    }
+                    None => drop(reply),
+                }
+                if sink.send(Message::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // 读任务：按 reqid 派发
+        let pending_r = pending.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(msg)) = src.next().await {
+                let text = match msg {
+                    Message::Text(t) => t.to_string(),
+                    Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
+                    Message::Close(_) => break,
+                    _ => continue,
+                };
+                let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                if v.get("res").and_then(|x| x.as_str()) == Some("pong") {
+                    continue;
+                }
+                if let Some(id) = v.get("reqid").and_then(|x| x.as_str()) {
+                    let id = id.to_string();
+                    if let Some((_, s)) = pending_r.remove(&id) {
+                        let _ = s.send(v);
+                        continue;
+                    }
+                }
+                // 服务端推送不能作为任何一个 RPC 的响应。
+
+            }
+        });
+
+        let client = Arc::new(Self {
+            conn_id: CONN_COUNTER.fetch_add(1, Ordering::Relaxed),
+            http: reqwest::Client::builder()
+                .danger_accept_invalid_certs(!config.verify_tls)
+                .timeout(Duration::from_secs(300))
+                .build()?,
+            config,
+            key: RwLock::new(Vec::new()),
+            uid: RwLock::new(0),
+            token: RwLock::new(String::new()),
+            machine_id: RwLock::new(String::new()),
+            tx,
+            pending,
+            req_seq: AtomicU64::new(1),
+        });
+
+        Ok(client)
+    }
+
+    fn next_reqid(&self) -> String {
+        let n = self.req_seq.fetch_add(1, Ordering::Relaxed);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        format!("{ts:012x}{n:08x}")
+    }
+
+    async fn send_wait(
+        &self,
+        reqid: &str,
+        text: String,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let (otx, orx) = oneshot::channel();
+        self.tx
+            .send((Some(reqid.to_string()), text, otx))
+            .await
+            .map_err(|_| anyhow!("ws closed"))?;
+        match tokio::time::timeout(timeout, orx).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(_)) => Err(anyhow!("ws reply dropped")),
+            Err(_) => Err(anyhow!("rpc timeout")),
+        }
+    }
+
+    /// 未认证请求（明文 JSON）。
+    pub async fn rpc_plain(&self, mut req: Value) -> Result<Value> {
+        let rid = self.next_reqid();
+        if let Some(o) = req.as_object_mut() {
+            o.insert("reqid".into(), Value::String(rid.clone()));
+        }
+        let text = serde_json::to_string(&req)?;
+        self.send_wait(&rid, text, Duration::from_secs(15)).await
+    }
+
+    /// 已认证请求（签名 + JSON）。
+    pub async fn rpc(&self, mut req: Value) -> Result<Value> {
+        let rid = self.next_reqid();
+        if let Some(o) = req.as_object_mut() {
+            o.insert("reqid".into(), Value::String(rid.clone()));
+        }
+        let js = serde_json::to_string(&req)?;
+        let key = self.key.read().clone();
+        let sig = crypto::hmac_b64(&key, &js);
+        self.send_wait(&rid, format!("{sig}{js}"), Duration::from_secs(30))
+            .await
+    }
+
+    /// 从 OAuth 保存的会话恢复连接，不需要保存用户密码。
+    pub async fn restore_session(&self, acc: &crate::service::nas_account::NasAccount) -> Result<()> {
+        use base64::Engine;
+        let key = base64::engine::general_purpose::STANDARD.decode(&acc.secret)
+            .map_err(|_| anyhow!("invalid saved session secret"))?;
+        if key.is_empty() || acc.token.is_empty() { return Err(anyhow!("saved session missing credentials")); }
+        *self.key.write() = key;
+        *self.uid.write() = acc.uid;
+        *self.token.write() = acc.token.clone();
+        *self.machine_id.write() = acc.nas_id.clone();
+        let si = self.rpc_plain(json!({"req":"util.getSI"})).await?;
+        let reply = self.rpc(json!({"req":"user.authToken", "token":acc.token,
+            "si":si.get("si").and_then(|v|v.as_str()).unwrap_or_default()})).await?;
+        if reply.get("result").and_then(|v|v.as_str()) != Some("succ") {
+            return Err(anyhow!("session authentication failed (code: {})", reply.get("code").unwrap_or(&Value::Null)));
+        }
+        Ok(())
+    }
+
+    pub async fn login(&self) -> Result<()> {
+        let pub_resp = self
+            .rpc_plain(json!({ "req": "util.crypto.getRSAPub" }))
+            .await?;
+        let pubkey = pub_resp
+            .get("pub")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("no rsa pub: {pub_resp}"))?
+            .to_string();
+
+        let si = self
+            .rpc_plain(json!({ "req": "util.getSI" }))
+            .await?
+            .get("si")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let key_str = crypto::new_key_str();
+        let iv = crypto::new_iv();
+        let payload = json!({
+            "req": "user.login",
+            "user": self.config.user,
+            "password": self.config.password,
+            "deviceName": self.config.device_name,
+            "deviceType": "PC",
+            "stay": true,
+            "did": "fn-sync-linux",
+            "si": si,
+        });
+        let pt = serde_json::to_vec(&payload)?;
+        let aes_ct = crypto::aes_cbc_encrypt(&key_str, &iv, &pt);
+        let rsa_ct = crypto::rsa_encrypt_pkcs1v15(&pubkey, &key_str)?;
+        let b = crypto::b64();
+
+        let resp = self
+            .rpc_plain(json!({
+                "req": "encrypted",
+                "iv": b.encode(iv),
+                "rsa": b.encode(rsa_ct),
+                "aes": b.encode(aes_ct),
+            }))
+            .await?;
+
+        if resp.get("result").and_then(|v| v.as_str()) != Some("succ") {
+            return Err(anyhow!("login failed: {resp}"));
+        }
+
+        let secret_b64 = resp
+            .get("secret")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("login: no secret"))?;
+        let secret_ct = b.decode(secret_b64).map_err(|e| anyhow!("secret b64: {e}"))?;
+        let key = crypto::aes_cbc_decrypt(&key_str, &iv, &secret_ct)?;
+        *self.key.write() = key;
+
+        *self.uid.write() = resp.get("uid").and_then(|v| v.as_i64()).unwrap_or(0);
+        if let Some(t) = resp.get("token").and_then(|v| v.as_str()) {
+            *self.token.write() = t.to_string();
+        }
+        if let Some(m) = resp.get("machineId").and_then(|v| v.as_str()) {
+            *self.machine_id.write() = m.to_string();
+        }
+        Ok(())
+    }
+
+    // ---------------- 文件 API ----------------
+    pub async fn ls_dir(&self) -> Result<Vec<RemoteEntry>> {
+        let r = self.rpc(json!({ "req": "file.lsDir" })).await?;
+        Ok(parse_entries(&r))
+    }
+
+    pub async fn ls(&self, path: &str) -> Result<Vec<RemoteEntry>> {
+        let r = self.rpc(json!({ "req": "file.ls", "path": path })).await?;
+        Ok(parse_entries(&r))
+    }
+
+    pub async fn mkdir(&self, path: &str) -> Result<()> {
+        let r = self.rpc(json!({ "req": "file.mkdir", "path": path })).await?;
+        if r.get("result").and_then(|v| v.as_str()) == Some("fail") {
+            let errno = r.get("errno").and_then(|v| v.as_i64()).unwrap_or(0);
+            // 已存在不算失败
+            if errno != 4362 {
+                return Err(anyhow!("mkdir failed: {r}"));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn remove(&self, paths: Vec<String>) -> Result<()> {
+        let r = self
+            .rpc(json!({ "req": "file.rm", "files": paths, "moveToTrashbin": false }))
+            .await?;
+        if r.get("result").and_then(|v| v.as_str()) == Some("fail") {
+            return Err(anyhow!("rm failed: {r}"));
+        }
+        Ok(())
+    }
+
+    pub async fn rename(&self, path: &str, new_name: &str) -> Result<()> {
+        let r = self
+            .rpc(json!({ "req": "file.rename", "path": path, "name": new_name }))
+            .await?;
+        if r.get("result").and_then(|v| v.as_str()) == Some("fail") {
+            return Err(anyhow!("rename failed: {r}"));
+        }
+        Ok(())
+    }
+
+    /// 递归列出远端目录（用于轮询比对）。
+    pub async fn remote_tree(&self, root: &str) -> Result<Vec<(String, RemoteEntry)>> {
+        let mut out = Vec::new();
+        let mut stack = vec![(root.trim_matches('/').to_string(), String::new())];
+        let mut guard = 0;
+        while let Some((dir, rel)) = stack.pop() {
+            guard += 1;
+            if guard > 20000 {
+                break;
+            }
+            let entries = match self.ls(&dir).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for e in entries {
+                let child_rel = if rel.is_empty() {
+                    e.name.clone()
+                } else {
+                    format!("{rel}/{}", e.name)
+                };
+                if e.is_dir() {
+                    stack.push((format!("{dir}/{}", e.name), child_rel.clone()));
+                }
+                out.push((child_rel, e));
+            }
+        }
+        Ok(out)
+    }
+
+    // ---------------- 下载 ----------------
+    pub async fn download(&self, remote: &str) -> Result<Vec<u8>> {
+        let r = self
+            .rpc(json!({ "req": "file.download", "files": [remote] }))
+            .await?;
+        let uri = r
+            .get("download")
+            .and_then(|d| d.get(0))
+            .and_then(|d| d.get("uri"))
+            .and_then(|u| u.as_str())
+            .ok_or_else(|| anyhow!("download: {r}"))?;
+        let url = format!("https://{}{}", self.config.host(), uri);
+        let resp = self.http.get(&url).send().await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("download http {}", resp.status()));
+        }
+        Ok(resp.bytes().await?.to_vec())
+    }
+
+    // ---------------- 上传 ----------------
+    pub async fn upload(&self, remote: &str, data: Vec<u8>, mtime: Option<i64>) -> Result<()> {
+        let overwrite = true;
+        let ck = self
+            .rpc(json!({
+                "req": "file.checkUpload",
+                "path": remote,
+                "size": data.len(),
+                "overwrite": overwrite,
+            }))
+            .await?;
+        if ck.get("result").and_then(|v| v.as_str()) != Some("succ") {
+            return Err(anyhow!("checkUpload failed: {ck}"));
+        }
+        let upload_name = ck
+            .get("uploadName")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| remote.rsplit('/').next().unwrap_or(remote).to_string());
+        let dir = remote.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let target = format!("{dir}/{upload_name}");
+
+        let enc = encode_uri_path(&target);
+        let key = self.key.read().clone();
+        let sig = crypto::hmac_b64(&key, &enc);
+        let mtime_s = mtime.unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+        });
+        let token = self.token.read().clone();
+
+        let part = reqwest::multipart::Part::bytes(data)
+            .file_name(upload_name.clone())
+            .mime_str("application/octet-stream")?;
+        let form = reqwest::multipart::Form::new().part("trim-upload-file", part);
+
+        let mut req = self
+            .http
+            .post(format!("https://{}/upload", self.config.host()))
+            .header("Trim-Path", enc)
+            .header("Trim-From", "0")
+            .header("Trim-Overwrite", if overwrite { "true" } else { "false" })
+            .header("Trim-Mtim", mtime_s.to_string())
+            .header("Trim-Token", token.clone())
+            .header("Trim-Sign", sig)
+            .multipart(form);
+        if !token.is_empty() {
+            req = req.header("Authorization", format!("trim {token}"));
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("upload http {status}: {text}"));
+        }
+        Ok(())
+    }
+}
+
+fn parse_entries(v: &Value) -> Vec<RemoteEntry> {
+    v.get("files")
+        .and_then(|f| f.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| serde_json::from_value::<RemoteEntry>(e.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 与 JS `encodeURI` 一致：保留 `/` 与 `-_.!~*'()`。
+fn encode_uri_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() * 3);
+    for b in path.bytes() {
+        let c = b as char;
+        let keep = c.is_ascii_alphanumeric()
+            || matches!(c, '/' | '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')');
+        if keep {
+            out.push(c);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn tls_config(_config: &NasConnConfig) -> Result<tokio_tungstenite::Connector> {
+    // fnOS NAS 使用自签证书，客户端固定跳过校验（与官方客户端行为一致）
+    Ok(tokio_tungstenite::Connector::Rustls(Arc::new(
+        skip_verify_config()?,
+    )))
+}
+
+pub fn skip_verify_config() -> Result<rustls::ClientConfig> {
+    #[derive(Debug)]
+    struct Skip;
+    impl rustls::client::danger::ServerCertVerifier for Skip {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _m: &[u8],
+            _c: &rustls::pki_types::CertificateDer<'_>,
+            _d: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+        {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _m: &[u8],
+            _c: &rustls::pki_types::CertificateDer<'_>,
+            _d: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+        {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                rustls::SignatureScheme::RSA_PKCS1_SHA384,
+                rustls::SignatureScheme::RSA_PKCS1_SHA512,
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+                rustls::SignatureScheme::RSA_PSS_SHA384,
+                rustls::SignatureScheme::RSA_PSS_SHA512,
+                rustls::SignatureScheme::ED25519,
+            ]
+        }
+    }
+    let provider = rustls::crypto::ring::default_provider();
+    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Skip))
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(cfg)
+}
