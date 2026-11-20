@@ -651,7 +651,7 @@ pub async fn open_oauth_window(
 pub fn oauth_put_auth_result(app: &tauri::AppHandle, data: Value) -> Result<(), String> {
     use tauri::{Manager, Emitter};
     app.state::<AppState>().last_auth_result.lock().replace(data.clone());
-    app.emit("oauth-result", &data).map_err(|e| e.to_string())?;
+    app.emit("oauth-result", serde_json::json!({"code": 0, "data": data})).map_err(|e| e.to_string())?;
     // 官方行为：授权完成后关闭授权窗口
     if let Some(w) = app.get_webview_window("async-oauth") {
         let _ = w.close();
@@ -683,7 +683,7 @@ pub async fn put_auth_result(
     // OAuth 窗口回传: token/long_token/secret/cookie/uid/username/machine_id/nas_id...
     use tauri::Emitter;
     state.last_auth_result.lock().replace(data.clone());
-    app.emit("oauth-result", &data).map_err(|e| e.to_string())?;
+    app.emit("oauth-result", serde_json::json!({"code": 0, "data": data})).map_err(|e| e.to_string())?;
     Ok(())
 }
 
