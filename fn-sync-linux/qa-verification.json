@@ -11,10 +11,10 @@
     "unit_and_actual_tauri_ipc": {
       "passed": 57,
       "failed": 0,
-      "live_tests_excluded_from_unit_run": 4
+      "live_tests_excluded_from_unit_run": 5
     },
     "live_nas": {
-      "passed": 4,
+      "passed": 5,
       "failed": 0,
       "isolated_test_directory_removed": true
     },
@@ -39,6 +39,11 @@
         "other plugin passthrough",
         "rejected command logging without argument values"
       ]
+    },
+    "destination_session_refresh": {
+      "result": "pass",
+      "address": "nas.example.com:5667",
+      "writes": "verified renewed access token saved to local account database"
     }
   },
   "live_coverage": [
@@ -59,7 +64,8 @@
     "stop and executor recreation",
     "offline local deletion after snapshot restore",
     "real socket disconnect and automatic reconnect",
-    "reject destination and staging-directory symlinks"
+    "reject destination and staging-directory symlinks",
+    "expired access token renewal through long token, authenticated verification, and database persistence"
   ],
   "unsupported_or_not_exercised": [
     "Linux on-demand placeholders are unsupported and disabled; ordinary sync is used",

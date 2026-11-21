@@ -74,6 +74,7 @@ impl TaskManager {
 
     pub async fn account_client(
         &self,
+        db: &sqlx::SqlitePool,
         acc: &NasAccount,
     ) -> Result<Arc<crate::connect::nas_client::NasClient>> {
         if let Some(client) = self.account_clients.get(&acc.id) {
@@ -85,6 +86,7 @@ impl TaskManager {
         let client =
             crate::connect::nas_client::NasClient::open(conn_config(&acc.address, "", "")).await?;
         client.restore_session(acc).await?;
+        client.persist_access_token(db, acc).await?;
         self.account_clients.insert(acc.id, client.clone());
         Ok(client)
     }
@@ -151,7 +153,7 @@ impl TaskManager {
         let filter = crate::tasks::file_filter::FileFilter::from_db(rule.as_ref())
             .with_excluded_paths(excluded);
 
-        let nas = self.account_client(acc).await?;
+        let nas = self.account_client(db, acc).await?;
 
         let (local_tx, local_rx) = mpsc::channel(4096);
 
@@ -295,7 +297,7 @@ mod session_tests {
             .find(|a| a.address == address)
             .expect("saved account");
         let manager = super::TaskManager::new();
-        let client = manager.account_client(&account).await.unwrap();
+        let client = manager.account_client(&db, &account).await.unwrap();
         let reply = client
             .rpc(serde_json::json!({"req":"file.lsDir"}))
             .await
@@ -304,10 +306,10 @@ mod session_tests {
             reply.get("files").and_then(|v| v.as_array()).is_some(),
             "directory response missing files"
         );
-        let cached = manager.account_client(&account).await.unwrap();
+        let cached = manager.account_client(&db, &account).await.unwrap();
         assert!(std::sync::Arc::ptr_eq(&client, &cached));
         manager.delete_client(account.id as u64);
-        let restored = manager.account_client(&account).await.unwrap();
+        let restored = manager.account_client(&db, &account).await.unwrap();
         assert!(!std::sync::Arc::ptr_eq(&client, &restored));
         let reply = restored
             .rpc(serde_json::json!({"req":"appcgi.sysinfo.getMachineId"}))
@@ -361,7 +363,7 @@ mod live_lifecycle_tests {
             .unwrap()
             .unwrap();
         let manager = super::TaskManager::new();
-        let nas = manager.account_client(&acc).await.unwrap();
+        let nas = manager.account_client(&db, &acc).await.unwrap();
         let parent = std::env::var("FN_SYNC_TEST_REMOTE_ROOT").unwrap();
         assert!(parent.contains("fn-sync-qa-"));
         let root = format!("{parent}/lifecycle-{}", uuid::Uuid::new_v4());
@@ -393,7 +395,7 @@ mod live_lifecycle_tests {
         manager.resume_task(id);
         wait_contents(&local.join("state.txt"), b"second-version").await;
         nas.disconnect();
-        let replacement = manager.account_client(&acc).await.unwrap();
+        let replacement = manager.account_client(&db, &acc).await.unwrap();
         assert!(!std::sync::Arc::ptr_eq(&nas, &replacement));
         replacement
             .upload(
@@ -426,5 +428,43 @@ mod live_lifecycle_tests {
         assert!(!restarted.is_running(id));
         crate::service::tasks::delete_task(&db, id).await.unwrap();
         replacement.remove(vec![root]).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod live_refresh_tests {
+    #[tokio::test]
+    #[ignore = "requires saved NAS long token; persists the verified renewed access token"]
+    async fn expired_access_token_refreshes_and_persists() {
+        let db = crate::service::database::open_db(std::path::Path::new(
+            &std::env::var("FN_SYNC_TEST_DB").unwrap(),
+        ))
+        .await
+        .unwrap();
+        let address = std::env::var("FN_SYNC_TEST_ADDRESS").unwrap();
+        let mut account = crate::service::nas_account::get_all_nas_accounts(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.address == address)
+            .unwrap();
+        account.token = "qa-expired-access-token".into();
+        let manager = super::TaskManager::new();
+        let client = manager
+            .account_client(&db, &account)
+            .await
+            .expect("refresh expired session");
+        assert_ne!(client.token.read().as_str(), "qa-expired-access-token");
+        let saved = crate::service::nas_account::get_nas_account_by_id(&db, account.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.token, client.token.read().as_str());
+        assert_eq!(*client.uid.read(), account.uid);
+        let reply = client
+            .rpc(serde_json::json!({"req":"file.lsDir"}))
+            .await
+            .unwrap();
+        assert!(reply["files"].is_array());
     }
 }

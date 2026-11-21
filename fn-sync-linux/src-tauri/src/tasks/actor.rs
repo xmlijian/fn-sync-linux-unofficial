@@ -123,6 +123,12 @@ impl TaskActor {
             .ok_or_else(|| anyhow::anyhow!("saved NAS account unavailable"))?;
         let replacement = NasClient::open(current.config().clone()).await?;
         replacement.restore_session(&account).await?;
+        replacement
+            .persist_access_token(&self.db_pool, &account)
+            .await?;
+        let mut saved = account;
+        saved.token = replacement.token.read().clone();
+        *self.saved_account.lock() = Some(saved);
         *self.nas.lock() = replacement.clone();
         Ok(replacement)
     }
@@ -690,7 +696,7 @@ mod live_mode_tests {
             .find(|a| a.address == address)
             .unwrap();
         let manager = crate::task_manager::TaskManager::new();
-        let nas = manager.account_client(&acc).await.unwrap();
+        let nas = manager.account_client(&live_db, &acc).await.unwrap();
         let remote_root = std::env::var("FN_SYNC_TEST_REMOTE_ROOT").unwrap();
         assert!(remote_root.contains("fn-sync-qa-"));
         for mode in ["bisynchronous", "uploadonly", "downloadonly"] {

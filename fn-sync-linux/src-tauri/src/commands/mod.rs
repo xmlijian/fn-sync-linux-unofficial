@@ -618,7 +618,7 @@ pub async fn send_message_from_connection_id(
             .task_manager
             .lock()
             .await
-            .account_client(&acc)
+            .account_client(&state.db, &acc)
             .await
             .map_err(|e| {
                 tracing::warn!(account_id = acc.id, error = %e, "session restore failed");
@@ -669,7 +669,7 @@ pub async fn validate_task_nas_dir_exists(
         .task_manager
         .lock()
         .await
-        .account_client(&acc)
+        .account_client(&state.db, &acc)
         .await
         .map_err(|e| e.to_string())?;
     let reply = client.rpc(serde_json::json!({"req":"file.ls", "path":nas_path.as_deref().unwrap_or(&task.nas_path).trim_start_matches('/')}))
@@ -1275,7 +1275,7 @@ async fn folder_layer(
             .task_manager
             .lock()
             .await
-            .account_client(&acc)
+            .account_client(&state.db, &acc)
             .await
             .map_err(|e| e.to_string())?;
         let base = if parent.is_empty() {
@@ -1658,7 +1658,7 @@ pub async fn send_message_from_temp_conn(
         .task_manager
         .lock()
         .await
-        .account_client(&acc)
+        .account_client(&state.db, &acc)
         .await
         .map_err(|e| e.to_string())?;
     client.rpc(message).await.map_err(|e| e.to_string())

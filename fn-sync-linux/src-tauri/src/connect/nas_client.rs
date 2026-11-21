@@ -306,8 +306,19 @@ impl NasClient {
         let js = serde_json::to_string(&req)?;
         let key = self.key.read().clone();
         let sig = crypto::hmac_b64(&key, &js);
-        self.send_wait(&rid, format!("{sig}{js}"), Duration::from_secs(30))
-            .await
+        let reply = self
+            .send_wait(&rid, format!("{sig}{js}"), Duration::from_secs(30))
+            .await?;
+        if reply.get("errno").and_then(|v| v.as_i64()) == Some(135168)
+            && !matches!(
+                req.get("req").and_then(|v| v.as_str()),
+                Some("user.authToken" | "user.tokenLogin")
+            )
+        {
+            self.disconnect();
+            return Err(anyhow!("NAS session expired"));
+        }
+        Ok(reply)
     }
 
     /// 从 OAuth 保存的会话恢复连接，不需要保存用户密码。
@@ -332,10 +343,52 @@ impl NasClient {
             "si":si.get("si").and_then(|v|v.as_str()).unwrap_or_default()}))
             .await?;
         if reply.get("result").and_then(|v| v.as_str()) != Some("succ") {
-            return Err(anyhow!(
-                "session authentication failed (code: {})",
-                reply.get("code").unwrap_or(&Value::Null)
-            ));
+            if acc.long_token.is_empty() {
+                return Err(anyhow!("saved NAS session expired; login required"));
+            }
+            let did = crate::platform::app_data_dir()
+                .ok()
+                .and_then(|dir| std::fs::read_to_string(dir.join("device_id")).ok())
+                .unwrap_or_else(|| "fn-sync-linux".into());
+            let refreshed = self
+                .rpc(json!({"req":"user.tokenLogin","token":acc.long_token,
+                "si":si.get("si").and_then(|v|v.as_str()).unwrap_or_default(),
+                "deviceType":"PC","deviceName":self.config.device_name,"did":did.trim()}))
+                .await?;
+            if refreshed.get("result").and_then(|v| v.as_str()) != Some("succ")
+                || refreshed.get("uid").and_then(|v| v.as_i64()) != Some(acc.uid)
+            {
+                return Err(anyhow!(
+                    "saved NAS refresh session rejected; login required"
+                ));
+            }
+            let token = refreshed
+                .get("token")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!("NAS refresh returned no access token"))?;
+            let verified=self.rpc(json!({"req":"user.authToken","token":token,"si":si.get("si").and_then(|v|v.as_str()).unwrap_or_default()})).await?;
+            if verified.get("result").and_then(|v| v.as_str()) != Some("succ") {
+                return Err(anyhow!("refreshed NAS session rejected"));
+            }
+            *self.token.write() = token.to_string();
+        }
+        Ok(())
+    }
+
+    pub async fn persist_access_token(
+        &self,
+        db: &sqlx::SqlitePool,
+        acc: &crate::service::nas_account::NasAccount,
+    ) -> Result<()> {
+        let token = self.token.read().clone();
+        if token != acc.token {
+            sqlx::query("UPDATE nas_accounts SET token=?1,updated_at=?2 WHERE id=?3")
+                .bind(token)
+                .bind(crate::service::database::now_ms())
+                .bind(acc.id)
+                .execute(db)
+                .await?;
         }
         Ok(())
     }
@@ -756,7 +809,7 @@ mod live_transfer_tests {
             .find(|a| a.address == address)
             .unwrap();
         let manager = crate::task_manager::TaskManager::new();
-        let nas = manager.account_client(&acc).await.unwrap();
+        let nas = manager.account_client(&db, &acc).await.unwrap();
         let root = std::env::var("FN_SYNC_TEST_REMOTE_ROOT").unwrap();
         assert!(root.contains("fn-sync-qa-"));
         let path = format!("{root}/中文上传.txt");

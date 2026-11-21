@@ -39,7 +39,7 @@ def receive_exact(sock, size):
 class Session:
     def __init__(self, address, account):
         self.address = address
-        self.account = account
+        self.account = dict(account)
         self.key = base64.b64decode(account['secret'])
         url = urllib.parse.urlsplit('https://' + address)
         self.context = ssl._create_unverified_context()
@@ -52,7 +52,19 @@ class Session:
         if b' 101 ' not in response.split(b'\r\n')[0]:
             raise RuntimeError('NAS websocket upgrade failed')
         si = self.rpc({'req': 'util.getSI'}, signed=False)
-        result = self.rpc({'req': 'user.authToken', 'token': account['token'], 'si': si.get('si', '')})
+        try:
+            result = self.rpc({'req': 'user.authToken', 'token': account['token'], 'si': si.get('si', '')})
+        except RuntimeError:
+            if not account['long_token']:
+                raise RuntimeError('saved NAS session expired; login required') from None
+            device_file = Path.home() / '.local/share/fn-sync-client/device_id'
+            did = device_file.read_text().strip() if device_file.exists() else 'fn-sync-linux'
+            refreshed = self.rpc({'req': 'user.tokenLogin', 'token': account['long_token'],
+                'si': si.get('si', ''), 'deviceType': 'PC', 'deviceName': 'Linux-PcSync', 'did': did})
+            if refreshed.get('uid') != account['uid'] or not refreshed.get('token'):
+                raise RuntimeError('NAS refresh returned an invalid account')
+            self.account['token'] = refreshed['token']
+            result = self.rpc({'req': 'user.authToken', 'token': refreshed['token'], 'si': si.get('si', '')})
         if result.get('result') != 'succ':
             raise RuntimeError('saved NAS session rejected')
 
