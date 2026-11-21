@@ -546,7 +546,7 @@ mod live_pause_inflight_tests {
             nas.mkdir(&remote).await.unwrap();
             let local = temp.path().join("local");
             std::fs::create_dir(&local).unwrap();
-            let bytes = vec![b'P'; 256 * 1024];
+            let bytes = vec![b'P'; 128 * 1024];
             if mode == "uploadonly" {
                 std::fs::write(local.join("big.bin"), &bytes).unwrap();
             } else {

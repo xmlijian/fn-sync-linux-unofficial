@@ -76,14 +76,16 @@
         "uploadonly",
         "downloadonly"
       ],
-      "file_bytes": 262144,
+      "file_bytes": 131072,
       "rate_kib_per_second": 64,
       "pause_during_transfer_after_ms": 1300,
       "pause_completed_within_seconds": 1,
       "post_pause_observation_ms": 1500,
       "resume_content_verified": true,
       "lifecycle_regression": "pass",
-      "cleanup": "isolated NAS directory removed"
+      "cleanup": "isolated NAS directory removed",
+      "normal_transfer_duration_seconds": 2,
+      "post_pause_observation_exceeds_normal_completion": true
     }
   },
   "live_coverage": [
