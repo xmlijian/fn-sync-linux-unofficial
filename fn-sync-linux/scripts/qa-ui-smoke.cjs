@@ -19,6 +19,9 @@ if(route==='/setting') {
  results.push(await evaluate(`({scenario:'settings export and unsupported updates',text:document.body.innerText.slice(-1600),errors:window.__qaErrors})`));
 }
 if(route==='/task') {
+ await evaluate(`(()=>{const label=[...document.querySelectorAll('*')].find(e=>e.children.length===0&&e.textContent.trim()==='电脑文件路径');if(!label)throw Error('local path label missing');label.click();})()`);await sleep(150);
+ if(!await evaluate(`window.__qaCalls.includes('reveal_item_in_dir')`))throw Error('local directory did not use app reveal command');
+
  await evaluate(`(()=>{const button=document.querySelector('button[aria-haspopup=true]');if(!button)throw Error('task actions button missing');button.click();})()`);await sleep(300);
  await evaluate(`(()=>{const e=[...document.querySelectorAll('*')].find(e=>e.children.length===0&&e.textContent.trim()==='任务设置');if(!e)throw Error('task settings menu missing');e.click();})()`);await sleep(700);
  fs.writeFileSync('/tmp/fn-ui-task.png',Buffer.from((await cmd('Page.captureScreenshot')).data,'base64'));results.push(await evaluate(`({scenario:'task settings',text:document.body.innerText.slice(-2200),errors:window.__qaErrors})`));
