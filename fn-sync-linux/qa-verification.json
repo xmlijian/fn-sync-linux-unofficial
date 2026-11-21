@@ -1,5 +1,5 @@
 {
-  "date": "2026-11-20",
+  "date": "2026-11-21",
   "scope": "Linux ordinary sync and existing UI/backend contracts",
   "result": "passed for tested scope",
   "checks": {
@@ -30,6 +30,15 @@
         "application settings page"
       ],
       "page_exceptions": 0
+    },
+    "ui_invoke_bridge": {
+      "result": "pass",
+      "coverage": [
+        "mDNS app command routing",
+        "immutable Tauri object",
+        "other plugin passthrough",
+        "rejected command logging without argument values"
+      ]
     }
   },
   "live_coverage": [
@@ -57,7 +66,8 @@
     "vendor automatic update download/install not executed",
     "system login/reboot and autostart launch not exercised",
     "FN Connect relay/fnid not implemented; direct IP/hostname connections used",
-    "Kylin 2303/2403/3503, UOS1070 and ARM/LoongArch require native build/runtime validation"
+    "Kylin 2303/2403/3503, UOS1070 and ARM/LoongArch require native build/runtime validation",
+    "LAN mDNS device discovery on target customer networks not exercised; IPC routing tested"
   ],
   "safety_bounds": "Only dedicated fn-sync-qa NAS directories and temporary local files were modified by live tests; normal task files were not used as test fixtures",
   "reproduce": {

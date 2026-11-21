@@ -82,9 +82,7 @@ pub fn run() {
                 return run_selftest(app, &url);
             }
 
-            // 官方前端调用 plugin:mdns|*，但应用内定义的插件受 ACL 限制；
-            // 这里在页面脚本执行前把这两条 IPC 转发到应用级命令，
-            // 官方前端资源保持完全未修改。
+            // mDNS 在界面的 invoke 包装函数中转发；这里仅收集页面异常。
             if let Some(win) = {
                 use tauri::Manager;
                 app.get_webview_window("main")
@@ -96,15 +94,6 @@ pub fn run() {
   I.__mdnsShim = true;
   const orig = I.invoke.bind(I);
   const log = (lvl, msg) => { try { orig('js_log', { level: lvl, message: String(msg).slice(0, 600) }); } catch(_){} };
-  I.invoke = function(cmd, args, opts) {
-    let real = cmd;
-    if (cmd === 'plugin:mdns|browse_many') real = 'mdns_browse_many';
-    else if (cmd === 'plugin:mdns|stop_browse') real = 'mdns_stop_browse';
-    const p = orig(real, args, opts);
-    if (cmd.startsWith('plugin:')) return p;
-    p.then(r => log('ipc-ok', cmd), e => log('ipc-err', cmd + ' :: ' + e));
-    return p;
-  };
   window.addEventListener('error', e => log('js-error', (e.message||'') + ' @ ' + (e.filename||'') + ':' + (e.lineno||'')));
   window.addEventListener('unhandledrejection', e => log('js-reject', (e.reason && (e.reason.stack || e.reason)) || 'unknown'));
   log('boot', 'shim installed, readyState=' + document.readyState);
