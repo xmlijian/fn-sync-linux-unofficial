@@ -197,24 +197,24 @@ pub async fn delete_task(state: State<'_, AppState>, id: i64) -> Result<(), Stri
 
 #[tauri::command]
 pub async fn pause_task(state: State<'_, AppState>, task_id: i64) -> Result<(), String> {
-    tasks::update_task_status(db(&state), task_id, crate::tasks::actor::status::PAUSED)
+    state
+        .task_manager
+        .lock()
         .await
-        .map_err(|e| e.to_string())?;
-    state.task_manager.lock().await.pause_task(task_id);
-    Ok(())
+        .pause_task(db(&state), task_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn resume_task(state: State<'_, AppState>, task_id: i64) -> Result<(), String> {
-    tasks::update_task_status(db(&state), task_id, crate::tasks::actor::status::SYNCING)
+    state
+        .task_manager
+        .lock()
         .await
-        .map_err(|e| e.to_string())?;
-    if state.task_manager.lock().await.is_running(task_id) {
-        state.task_manager.lock().await.resume_task(task_id);
-        Ok(())
-    } else {
-        reload_task(state, task_id).await
-    }
+        .resume_task(db(&state), task_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

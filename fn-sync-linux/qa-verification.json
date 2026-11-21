@@ -11,7 +11,7 @@
     "unit_and_actual_tauri_ipc": {
       "passed": 59,
       "failed": 0,
-      "live_tests_excluded_from_unit_run": 6
+      "live_tests_excluded_from_unit_run": 7
     },
     "live_nas": {
       "passed": 5,
@@ -28,7 +28,8 @@
         "selective sync tab",
         "log page with entries",
         "application settings page",
-        "settings export save path and unsupported update dialog"
+        "settings export save path and unsupported update dialog",
+        "pause/resume state refresh"
       ],
       "page_exceptions": 0
     },
@@ -68,6 +69,21 @@
         "manual check update explicitly unsupported; automatic update disabled",
         "autostart file test isolated from user configuration"
       ]
+    },
+    "pause_inflight": {
+      "result": "pass",
+      "modes": [
+        "uploadonly",
+        "downloadonly"
+      ],
+      "file_bytes": 262144,
+      "rate_kib_per_second": 64,
+      "pause_during_transfer_after_ms": 1300,
+      "pause_completed_within_seconds": 1,
+      "post_pause_observation_ms": 1500,
+      "resume_content_verified": true,
+      "lifecycle_regression": "pass",
+      "cleanup": "isolated NAS directory removed"
     }
   },
   "live_coverage": [
@@ -89,7 +105,8 @@
     "offline local deletion after snapshot restore",
     "real socket disconnect and automatic reconnect",
     "reject destination and staging-directory symlinks",
-    "expired access token renewal through long token, authenticated verification, and database persistence"
+    "expired access token renewal through long token, authenticated verification, and database persistence",
+    "pause cancels active HTTP uploads/downloads; paused status is retained and resume rechecks files"
   ],
   "unsupported_or_not_exercised": [
     "Linux on-demand placeholders are unsupported and disabled; ordinary sync is used",

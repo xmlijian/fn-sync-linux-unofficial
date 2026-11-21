@@ -217,16 +217,45 @@ impl TaskManager {
         }
     }
 
-    pub fn pause_task(&self, task_id: i64) {
-        if let Some(r) = self.running.get(&task_id) {
-            r.actor.pause();
+    pub async fn pause_task(&self, db: &sqlx::SqlitePool, task_id: i64) -> Result<()> {
+        if crate::service::tasks::get_task_by_id(db, task_id)
+            .await?
+            .is_none()
+        {
+            return Err(anyhow!("task not found"));
         }
+        self.stop_task(task_id).await;
+        crate::service::tasks::update_task_status(db, task_id, crate::tasks::actor::status::PAUSED)
+            .await?;
+        tracing::info!(task_id, "task paused; executor stopped");
+        Ok(())
     }
 
-    pub fn resume_task(&self, task_id: i64) {
-        if let Some(r) = self.running.get(&task_id) {
-            r.actor.resume();
+    pub async fn resume_task(&self, db: &sqlx::SqlitePool, task_id: i64) -> Result<()> {
+        let task = crate::service::tasks::get_task_by_id(db, task_id)
+            .await?
+            .ok_or_else(|| anyhow!("task not found"))?;
+        let account = crate::service::nas_account::get_nas_account_by_id(db, task.nas_acc_id)
+            .await?
+            .ok_or_else(|| anyhow!("account not found"))?;
+        self.stop_task(task_id).await;
+        crate::service::tasks::update_task_status(
+            db,
+            task_id,
+            crate::tasks::actor::status::SYNCING,
+        )
+        .await?;
+        if let Err(error) = self.start_task(db, task_id, &account).await {
+            let _ = crate::service::tasks::update_task_status(
+                db,
+                task_id,
+                crate::tasks::actor::status::FAILED,
+            )
+            .await;
+            return Err(error);
         }
+        tracing::info!(task_id, "task resumed; executor recreated");
+        Ok(())
     }
 
     pub fn is_running(&self, task_id: i64) -> bool {
@@ -381,7 +410,7 @@ mod live_lifecycle_tests {
         manager.start_task(&db, id, &acc).await.unwrap();
         wait_contents(&local.join("state.txt"), b"first").await;
         assert!(manager.is_running(id));
-        manager.pause_task(id);
+        manager.pause_task(&db, id).await.unwrap();
         assert_eq!(manager.running_count(), 0);
         nas.upload(
             &format!("{root}/state.txt"),
@@ -392,7 +421,7 @@ mod live_lifecycle_tests {
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         assert_eq!(std::fs::read(local.join("state.txt")).unwrap(), b"first");
-        manager.resume_task(id);
+        manager.resume_task(&db, id).await.unwrap();
         wait_contents(&local.join("state.txt"), b"second-version").await;
         nas.disconnect();
         let replacement = manager.account_client(&db, &acc).await.unwrap();
@@ -466,5 +495,126 @@ mod live_refresh_tests {
             .await
             .unwrap();
         assert!(reply["files"].is_array());
+    }
+}
+
+#[cfg(test)]
+mod live_pause_inflight_tests {
+    #[tokio::test]
+    #[ignore = "requires isolated NAS root and saved OAuth session"]
+    async fn pause_cancels_active_upload_and_download_and_resume_completes() {
+        use std::time::{Duration, Instant};
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::traffic::set_limit("global_upload_speed_limit", "-1");
+                crate::traffic::set_limit("global_download_speed_limit", "-1");
+            }
+        }
+        let _reset = Reset;
+        let source = crate::service::database::open_db(std::path::Path::new(
+            &std::env::var("FN_SYNC_TEST_DB").unwrap(),
+        ))
+        .await
+        .unwrap();
+        let address = std::env::var("FN_SYNC_TEST_ADDRESS").unwrap();
+        let original = crate::service::nas_account::get_all_nas_accounts(&source)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.address == address)
+            .unwrap();
+        let root = std::env::var("FN_SYNC_TEST_REMOTE_ROOT").unwrap();
+        assert!(root.contains("fn-sync-qa-"));
+        for mode in ["uploadonly", "downloadonly"] {
+            let temp = tempfile::tempdir().unwrap();
+            let db = crate::service::database::open_db(&temp.path().join("test.sqlite"))
+                .await
+                .unwrap();
+            crate::service::database::migrate(&db).await.unwrap();
+            let create = serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+            let account_id = crate::service::nas_account::add_nas_account(&db, &create)
+                .await
+                .unwrap();
+            let account = crate::service::nas_account::get_nas_account_by_id(&db, account_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let manager = super::TaskManager::new();
+            let nas = manager.account_client(&db, &account).await.unwrap();
+            let remote = format!("{root}/inflight-{mode}-{}", uuid::Uuid::new_v4());
+            nas.mkdir(&remote).await.unwrap();
+            let local = temp.path().join("local");
+            std::fs::create_dir(&local).unwrap();
+            let bytes = vec![b'P'; 256 * 1024];
+            if mode == "uploadonly" {
+                std::fs::write(local.join("big.bin"), &bytes).unwrap();
+            } else {
+                nas.upload(&format!("{remote}/big.bin"), bytes.clone(), None)
+                    .await
+                    .unwrap();
+            }
+            let key = if mode == "uploadonly" {
+                "global_upload_speed_limit"
+            } else {
+                "global_download_speed_limit"
+            };
+            crate::traffic::set_limit(key, "64");
+            let task=serde_json::from_value(serde_json::json!({"name":"pause in flight","address":address,"conn_type":"ip","uuid":"1","identifier":"qa","mode":mode,"nas_path":remote,"pc_path":local,"nas_acc_id":account_id,"open_cloud":false})).unwrap();
+            let id = crate::service::tasks::add_task(&db, &task).await.unwrap();
+            manager.start_task(&db, id, &account).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1300)).await;
+            let started = Instant::now();
+            manager.pause_task(&db, id).await.unwrap();
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "pause waited for entire transfer"
+            );
+            assert!(!manager.is_running(id));
+            assert_eq!(
+                crate::service::tasks::get_task_by_id(&db, id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                crate::tasks::actor::status::PAUSED
+            );
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            if mode == "downloadonly" {
+                assert!(
+                    !local.join("big.bin").exists(),
+                    "download continued after pause"
+                );
+            } else {
+                assert!(
+                    !nas.ls(&remote)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|e| e.name == "big.bin"),
+                    "upload completed after pause"
+                );
+            }
+            crate::traffic::set_limit(key, "-1");
+            manager.resume_task(&db, id).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    let complete = if mode == "downloadonly" {
+                        std::fs::read(local.join("big.bin")).ok() == Some(bytes.clone())
+                    } else {
+                        nas.download(&format!("{remote}/big.bin")).await.ok() == Some(bytes.clone())
+                    };
+                    if complete {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .expect("resume did not finish transfer");
+            manager.stop_task(id).await;
+            nas.remove(vec![remote]).await.unwrap();
+            eprintln!("PASS {mode}: active transfer canceled, paused status retained, resume content verified");
+        }
     }
 }

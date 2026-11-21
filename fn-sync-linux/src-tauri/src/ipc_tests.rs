@@ -45,6 +45,7 @@ fn ui_task_creation_settings_logs_and_deletion_contracts() {
             commands::get_task_by_id,
             commands::get_all_tasks,
             commands::delete_task,
+            commands::pause_task,
             commands::get_filter_rule_by_task_id,
             commands::update_task,
             commands::edit_open_cloud,
@@ -223,6 +224,11 @@ fn ui_task_creation_settings_logs_and_deletion_contracts() {
     ] {
         assert!(counts[key].is_number(), "missing {key}");
     }
+    invoke(&window, "pause_task", json!({"taskId":id}));
+    assert_eq!(
+        invoke(&window, "get_task_by_id", json!({"id":id}))["status"],
+        3
+    );
     let summary = invoke(&window, "get_task_status_summary", json!({"taskId":id}));
     assert!(summary["processing_count"].is_number());
     invoke(

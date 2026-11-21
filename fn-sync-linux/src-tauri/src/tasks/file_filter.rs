@@ -11,6 +11,7 @@ const BUILTIN_PATTERNS: &[&str] = &[
     r".*FNSYNC.*",
     r".*\.tmp$",
     r".*\.temp$",
+    r".*\.~#0$",
     r"^#.*",
     r"^\.download($|/)",
 ];

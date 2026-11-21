@@ -85,3 +85,5 @@ FN_SYNC_UI_FIXTURES=/tmp/fn-ui-fixtures.json node scripts/qa-ui-smoke.cjs
 检查更新与自动更新当前不接入，界面会提示暂不支持。
 `saved_sync_logs_are_visible_with_actual_ui_date_payload` 是只读实库检查，需要已有同步日志；
 它会在临时目录验证实际导出内容。
+
+暂停任务会停止当前执行器并取消未完成传输；继续时重新创建执行器，从保存的基线重新核对文件。已提交给 NAS 的服务端操作可能完成收尾，不进行回滚。界面操作后立即刷新状态，并每秒更新任务列表。
