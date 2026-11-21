@@ -113,8 +113,17 @@ class Session:
         })
         with urllib.request.urlopen(req, context=self.context, timeout=120) as response:
             response.read()
-        info = self.rpc({'req': 'file.download', 'files': [remote]})
-        uri = info['download'][0]['uri']
+        # Large uploads may be listed before their download metadata is ready.
+        deadline = time.monotonic() + 30
+        while True:
+            info = self.rpc({'req': 'file.download', 'files': [remote]})
+            entries = info.get('download', [])
+            uri = entries[0].get('uri') if entries else None
+            if uri:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError('NAS upload finalization timed out')
+            time.sleep(0.2)
         url = urllib.parse.urljoin('https://' + self.address, uri)
         if urllib.parse.urlsplit(url).netloc != self.address:
             raise RuntimeError('unexpected NAS download host')
