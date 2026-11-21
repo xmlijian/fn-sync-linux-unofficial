@@ -1,4 +1,4 @@
-//! 日志服务 — logs 表 + log.sqlite 保存策略（log_save_day/log_save_size）。
+//! 同步日志服务 — 主数据库 logs 表及保存策略（log_save_day/log_save_size）。
 
 use super::database::now_ms;
 use anyhow::Result;
@@ -39,10 +39,10 @@ pub struct LogEntry {
 #[derive(Debug, Deserialize)]
 pub struct GetLogsParams {
     #[serde(default)]
-    #[serde(alias = "startTime")]
+    #[serde(alias = "startTime", deserialize_with = "deserialize_optional_integer")]
     pub start_time: Option<i64>,
     #[serde(default)]
-    #[serde(alias = "endTime")]
+    #[serde(alias = "endTime", deserialize_with = "deserialize_optional_integer")]
     pub end_time: Option<i64>,
     #[serde(default)]
     pub keyword: Option<String>,
@@ -54,11 +54,41 @@ pub struct GetLogsParams {
     #[serde(default)]
     #[serde(alias = "taskId")]
     pub task_id: Option<i64>,
-    #[serde(default = "default_page_size")]
+    #[serde(
+        default = "default_page_size",
+        deserialize_with = "deserialize_page_size"
+    )]
     #[serde(alias = "pageSize")]
     pub page_size: i64,
     #[serde(default)]
     pub page: i64,
+}
+
+fn deserialize_optional_integer<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<i64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Input {
+        Number(i64),
+        Text(String),
+    }
+    match Option::<Input>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Input::Number(number)) => Ok(Some(number)),
+        Some(Input::Text(text)) if text.trim().is_empty() => Ok(None),
+        Some(Input::Text(text)) => text
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+fn deserialize_page_size<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<i64, D::Error> {
+    Ok(deserialize_optional_integer(deserializer)?.unwrap_or_else(default_page_size))
 }
 
 fn default_page_size() -> i64 {
@@ -102,6 +132,25 @@ pub async fn add_log(pool: &SqlitePool, log: NewLog<'_>) -> Result<i64> {
     Ok(id)
 }
 
+/// Stream only sync records into the export; never include account credentials.
+pub async fn export_records(pool: &SqlitePool, destination: &std::path::Path) -> Result<u64> {
+    use futures_util::TryStreamExt;
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::io::BufWriter::new(tokio::fs::File::create(destination).await?);
+    let mut rows =
+        sqlx::query_as::<_, LogEntry>("SELECT * FROM logs ORDER BY created_at DESC,id DESC")
+            .fetch(pool);
+    let mut count = 0;
+    while let Some(row) = rows.try_next().await? {
+        let mut line = serde_json::to_vec(&row)?;
+        line.push(b'\n');
+        file.write_all(&line).await?;
+        count += 1;
+    }
+    file.flush().await?;
+    Ok(count)
+}
+
 pub async fn query_logs(pool: &SqlitePool, p: &GetLogsParams) -> Result<(Vec<LogEntry>, i64)> {
     let mut where_parts: Vec<String> = vec!["1=1".into()];
     if let Some(t) = p.start_time {
@@ -131,7 +180,7 @@ pub async fn query_logs(pool: &SqlitePool, p: &GetLogsParams) -> Result<(Vec<Log
     let sql = format!(
         "SELECT id, task_id, is_dir, name, path, sync_folder, action_code, status, failed_code, \
          failed_text, payload, created_at FROM logs WHERE {where_clause} \
-         ORDER BY created_at DESC LIMIT {} OFFSET {}",
+         ORDER BY created_at DESC, id DESC LIMIT {} OFFSET {}",
         p.page_size, offset
     );
     let rows = sqlx::query_as::<_, LogEntry>(&sql).fetch_all(pool).await?;
@@ -141,7 +190,7 @@ pub async fn query_logs(pool: &SqlitePool, p: &GetLogsParams) -> Result<(Vec<Log
 pub async fn get_logs_by_size(pool: &SqlitePool, size: i64) -> Result<Vec<LogEntry>> {
     let rows = sqlx::query_as::<_, LogEntry>(
         "SELECT id, task_id, is_dir, name, path, sync_folder, action_code, status, failed_code, \
-         failed_text, payload, created_at FROM logs ORDER BY created_at DESC LIMIT ?1",
+         failed_text, payload, created_at FROM logs ORDER BY created_at DESC, id DESC LIMIT ?1",
     )
     .bind(size.clamp(1, 1000))
     .fetch_all(pool)
@@ -164,31 +213,19 @@ pub async fn check_and_clear_logs(pool: &SqlitePool) -> Result<u64> {
         .await?
         .and_then(|v| v.parse().ok())
         .unwrap_or(1_000_000);
-    let cutoff = now_ms() - save_day * 86_400_000;
-    let mut removed: u64 = if save_day <= 0 {
-        sqlx::query("DELETE FROM logs")
-            .execute(pool)
-            .await?
-            .rows_affected()
-    } else {
-        sqlx::query("DELETE FROM logs WHERE created_at < ?1")
+    let mut removed = 0;
+    // 界面中的 0 表示“不限”，不能解释为清空日志。
+    if save_day > 0 {
+        let cutoff = now_ms().saturating_sub(save_day.saturating_mul(86_400_000));
+        removed += sqlx::query("DELETE FROM logs WHERE created_at < ?1")
             .bind(cutoff)
             .execute(pool)
             .await?
-            .rows_affected()
-    };
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM logs")
-        .fetch_one(pool)
-        .await?;
-    if count > save_size {
-        let overflow = count - save_size;
-        let r = sqlx::query(
-            "DELETE FROM logs WHERE id IN (SELECT id FROM logs ORDER BY created_at ASC LIMIT ?1)",
-        )
-        .bind(overflow)
-        .execute(pool)
-        .await?;
-        removed += r.rows_affected();
+            .rows_affected();
+    }
+    if save_size > 0 {
+        removed+=sqlx::query("DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY created_at DESC, id DESC LIMIT ?1)")
+            .bind(save_size).execute(pool).await?.rows_affected();
     }
     Ok(removed)
 }
@@ -310,7 +347,7 @@ mod tests {
     #[tokio::test]
     async fn retention_by_day() {
         let (_d, p) = pool().await;
-        set_system_value(&p, "log_save_day", "0").await.unwrap();
+        set_system_value(&p, "log_save_day", "30").await.unwrap();
         add_log(
             &p,
             NewLog {
@@ -328,6 +365,11 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query("UPDATE logs SET created_at=?1")
+            .bind(now_ms() - 31 * 86_400_000)
+            .execute(&p)
+            .await
+            .unwrap();
         let removed = check_and_clear_logs(&p).await.unwrap();
         assert_eq!(removed, 1);
     }
@@ -355,5 +397,72 @@ mod ui_input_tests {
         assert_eq!(params.start_time, Some(100));
         assert_eq!(params.end_time, Some(200));
         assert_eq!(params.page_size, 25);
+    }
+}
+
+#[cfg(test)]
+mod date_filter_contract_tests {
+    #[test]
+    fn accepts_actual_ui_empty_and_string_timestamps() {
+        let empty: super::GetLogsParams = serde_json::from_value(
+            serde_json::json!({"startTime":"","endTime":"","pageSize":null,"page":1}),
+        )
+        .unwrap();
+        assert_eq!(empty.start_time, None);
+        assert_eq!(empty.end_time, None);
+        assert_eq!(empty.page_size, 100);
+        let selected: super::GetLogsParams = serde_json::from_value(
+            serde_json::json!({"startTime":"1795221529873","endTime":"1795221881324"}),
+        )
+        .unwrap();
+        assert_eq!(selected.start_time, Some(1795221529873));
+        assert_eq!(selected.end_time, Some(1795221881324));
+        assert!(serde_json::from_value::<super::GetLogsParams>(
+            serde_json::json!({"startTime":"bad-date"})
+        )
+        .is_err());
+    }
+    #[tokio::test]
+    async fn unlimited_retention_never_deletes_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::service::database::open_db(&dir.path().join("logs.sqlite"))
+            .await
+            .unwrap();
+        crate::service::database::migrate(&db).await.unwrap();
+        super::set_system_value(&db, "log_save_day", "0")
+            .await
+            .unwrap();
+        super::set_system_value(&db, "log_save_size", "0")
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            super::add_log(
+                &db,
+                super::NewLog {
+                    task_id: 1,
+                    is_dir: false,
+                    name: "keep",
+                    path: "keep",
+                    sync_folder: "test",
+                    action_code: 1,
+                    status: 1,
+                    failed_code: 0,
+                    failed_text: None,
+                    payload: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE logs SET created_at=1")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(super::check_and_clear_logs(&db).await.unwrap(), 0);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM logs")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
     }
 }

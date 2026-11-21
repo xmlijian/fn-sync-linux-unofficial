@@ -411,9 +411,31 @@ pub async fn update_system_table(
     key: String,
     value: String,
 ) -> Result<(), String> {
+    if matches!(
+        key.as_str(),
+        "global_upload_speed_limit"
+            | "global_download_speed_limit"
+            | "log_save_day"
+            | "log_save_size"
+    ) {
+        let numeric = value.parse::<i64>().map_err(|_| "设置值必须是整数")?;
+        if numeric < if key.starts_with("global_") { -1 } else { 0 } {
+            return Err("设置值超出有效范围".into());
+        }
+    }
+    if key == "auto_update" && value != "0" {
+        return Err("暂不支持自动更新，请手动安装更新包".into());
+    }
     logs::set_system_value(db(&state), &key, &value)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    crate::traffic::set_limit(&key, &value);
+    if matches!(key.as_str(), "log_save_day" | "log_save_size") {
+        logs::check_and_clear_logs(db(&state))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -425,20 +447,60 @@ pub async fn get_app_log_dir(state: State<'_, AppState>) -> Result<String, Strin
 }
 
 #[tauri::command]
-pub async fn export_log_file(_state: State<'_, AppState>) -> Result<String, String> {
-    let logs = crate::platform::app_log_dir().map_err(|e| e.to_string())?;
-    let target = std::env::temp_dir().join(format!("fn-sync-logs-{}.tar.gz", uuid::Uuid::new_v4()));
-    let status = std::process::Command::new("tar")
-        .arg("-czf")
-        .arg(&target)
-        .arg("-C")
-        .arg(logs)
-        .arg(".")
-        .status()
-        .map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("log archive failed".into());
+pub async fn export_log_file(
+    state: State<'_, AppState>,
+    path: Option<String>,
+) -> Result<String, String> {
+    struct ExportFiles {
+        stage: std::path::PathBuf,
+        partial: std::path::PathBuf,
     }
+    impl Drop for ExportFiles {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.stage);
+            let _ = std::fs::remove_file(&self.partial);
+        }
+    }
+    let logs_dir = crate::platform::app_log_dir().map_err(|e| e.to_string())?;
+    let mut target = path.map(std::path::PathBuf::from).unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("fn-sync-logs-{}.tar.gz", uuid::Uuid::new_v4()))
+    });
+    if !target.to_string_lossy().ends_with(".tar.gz") {
+        target = std::path::PathBuf::from(format!("{}.tar.gz", target.display()));
+    }
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or("invalid log export destination")?;
+    let files = ExportFiles {
+        stage: std::env::temp_dir().join(format!("fn-sync-export-{}", uuid::Uuid::new_v4())),
+        partial: parent.join(format!(".fn-sync-export-{}.partial", uuid::Uuid::new_v4())),
+    };
+    std::fs::create_dir(&files.stage).map_err(|e| e.to_string())?;
+    logs::export_records(db(&state), &files.stage.join("sync-logs.jsonl"))
+        .await
+        .map_err(|e| e.to_string())?;
+    let output = tokio::process::Command::new("tar")
+        .arg("-czf")
+        .arg(&files.partial)
+        .arg("-C")
+        .arg(&files.stage)
+        .arg("sync-logs.jsonl")
+        .arg("-C")
+        .arg(logs_dir)
+        .arg(".")
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "log export failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    tokio::fs::rename(&files.partial, &target)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(target.display().to_string())
 }
 

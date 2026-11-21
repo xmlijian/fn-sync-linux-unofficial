@@ -44,6 +44,8 @@ impl AppState {
                 crate::traffic::set_limit(key, &value);
             }
         }
+        service::logs::set_system_value(&db, "auto_update", "0").await?;
+        service::logs::check_and_clear_logs(&db).await?;
         // 日志库独立文件（log.sqlite），与官方一致共享 schema
         let log_db = service::database::open_db(&dir.join("log.sqlite")).await?;
         service::database::migrate(&log_db).await?;
@@ -117,6 +119,13 @@ pub fn run() {
                                     let _ = service::tasks::update_task_status(&state.db,task.id,tasks::actor::status::FAILED).await;
                                 }
                             }
+                        }
+                    }
+                    let mut interval=tokio::time::interval(std::time::Duration::from_secs(60));
+                    loop {
+                        interval.tick().await;
+                        if let Err(error)=service::logs::check_and_clear_logs(&state.db).await {
+                            tracing::warn!(error=%error,"log retention maintenance failed");
                         }
                     }
                 });

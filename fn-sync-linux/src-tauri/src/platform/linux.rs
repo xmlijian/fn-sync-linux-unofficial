@@ -19,18 +19,27 @@ pub fn app_log_dir() -> Result<PathBuf> {
 /// 开机自启：写 ~/.config/autostart/fn-sync-client.desktop（官方 settings.autoStart 语义）。
 pub fn set_autostart(enabled: bool) -> Result<()> {
     let config_dir = dirs::config_dir().context("no config dir")?;
-    let autostart = config_dir.join("autostart");
-    let desktop = autostart.join("fn-sync-client.desktop");
+    let desktop = config_dir.join("autostart/fn-sync-client.desktop");
+    set_autostart_file(
+        &desktop,
+        enabled,
+        &std::env::current_exe().context("current exe")?,
+    )
+}
+
+fn set_autostart_file(
+    desktop: &std::path::Path,
+    enabled: bool,
+    exe: &std::path::Path,
+) -> Result<()> {
     if enabled {
-        std::fs::create_dir_all(&autostart)?;
-        let exe = std::env::current_exe().context("current exe")?;
-        let content = format!(
-            "[Desktop Entry]\nType=Application\nName=飞牛同步\nExec={} --autostart\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
-            exe.display()
-        );
-        std::fs::write(&desktop, content)?;
-    } else {
-        let _ = std::fs::remove_file(&desktop);
+        std::fs::create_dir_all(desktop.parent().context("invalid autostart path")?)?;
+        let content=format!("[Desktop Entry]\nType=Application\nName=飞牛同步\nExec={} --autostart\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",exe.display());
+        std::fs::write(desktop, content)?;
+    } else if let Err(error) = std::fs::remove_file(desktop) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
     }
     Ok(())
 }
@@ -113,10 +122,24 @@ mod tests {
 
     #[test]
     fn autostart_toggle() {
-        set_autostart(true).unwrap();
-        assert!(is_autostart_enabled());
-        set_autostart(false).unwrap();
-        assert!(!is_autostart_enabled());
+        let dir = tempfile::tempdir().unwrap();
+        let desktop = dir.path().join("autostart/fn-sync-client.desktop");
+        set_autostart_file(
+            &desktop,
+            true,
+            std::path::Path::new("/usr/bin/fn-sync-client"),
+        )
+        .unwrap();
+        assert!(std::fs::read_to_string(&desktop)
+            .unwrap()
+            .contains("Exec=/usr/bin/fn-sync-client --autostart"));
+        set_autostart_file(
+            &desktop,
+            false,
+            std::path::Path::new("/usr/bin/fn-sync-client"),
+        )
+        .unwrap();
+        assert!(!desktop.exists());
     }
 
     #[test]

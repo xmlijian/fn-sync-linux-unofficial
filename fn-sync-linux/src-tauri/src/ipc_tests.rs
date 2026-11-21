@@ -111,7 +111,7 @@ fn ui_task_creation_settings_logs_and_deletion_contracts() {
     let logs = invoke(
         &window,
         "query_logs",
-        json!({"params":{"taskId":id,"pageSize":25,"page":1,"actionCode":null,"startTime":null,"endTime":null}}),
+        json!({"params":{"taskId":id,"pageSize":25,"page":1,"actionCode":null,"startTime":"","endTime":""}}),
     );
     assert!(logs["list"].is_array());
     assert_eq!(logs["total"], 1);
@@ -131,6 +131,17 @@ fn ui_task_creation_settings_logs_and_deletion_contracts() {
     invoke(
         &window,
         "update_system_table",
+        json!({"key":"global_upload_speed_limit","value":"64"}),
+    );
+    let started = std::time::Instant::now();
+    tauri::async_runtime::block_on(crate::traffic::throttle(4096, true));
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(50),
+        "saved speed setting did not apply immediately"
+    );
+    invoke(
+        &window,
+        "update_system_table",
         json!({"key":"global_upload_speed_limit","value":"-1"}),
     );
     let settings = invoke(&window, "get_all_system_table", json!({}));
@@ -139,10 +150,44 @@ fn ui_task_creation_settings_logs_and_deletion_contracts() {
         .unwrap()
         .iter()
         .any(|row| row["key"] == "global_upload_speed_limit" && row["value"] == "-1"));
-    let exported = invoke(&window, "export_log_file", json!({}))
-        .as_str()
-        .unwrap()
-        .to_string();
+    invoke(
+        &window,
+        "update_system_table",
+        json!({"key":"log_save_size","value":"0"}),
+    );
+    assert_eq!(
+        invoke(
+            &window,
+            "query_logs",
+            json!({"params":{"startTime":"","endTime":"","page":1}})
+        )["total"],
+        1
+    );
+    invoke(
+        &window,
+        "add_log",
+        json!({"log":{"task_id":id,"name":"most-recent.txt","path":"most-recent.txt","action_code":1,"status":1}}),
+    );
+    invoke(
+        &window,
+        "update_system_table",
+        json!({"key":"log_save_size","value":"1"}),
+    );
+    let retained = invoke(
+        &window,
+        "query_logs",
+        json!({"params":{"startTime":"","endTime":"","page":1}}),
+    );
+    assert_eq!(retained["total"], 1);
+    assert_eq!(retained["list"][0]["name"], "most-recent.txt");
+    let exported = invoke(
+        &window,
+        "export_log_file",
+        json!({"path":temp.path().join("同步日志")}),
+    )
+    .as_str()
+    .unwrap()
+    .to_string();
     assert!(std::fs::read(&exported).unwrap().starts_with(&[0x1f, 0x8b]));
     assert!(std::process::Command::new("tar")
         .arg("-tzf")
@@ -151,6 +196,16 @@ fn ui_task_creation_settings_logs_and_deletion_contracts() {
         .unwrap()
         .status
         .success());
+    assert!(exported.ends_with("同步日志.tar.gz"));
+    let records = std::process::Command::new("tar")
+        .arg("-xOzf")
+        .arg(&exported)
+        .arg("sync-logs.jsonl")
+        .output()
+        .unwrap();
+    assert!(records.status.success());
+    let record: Value = serde_json::from_slice(&records.stdout).unwrap();
+    assert_eq!(record["name"], "most-recent.txt");
     std::fs::remove_file(exported).unwrap();
     let counts = invoke(&window, "get_global_tasks_status", json!({}));
     assert_eq!(counts["task_count"], 1);
@@ -201,4 +256,75 @@ fn ui_task_creation_settings_logs_and_deletion_contracts() {
     }
     invoke(&window, "delete_task", json!({"id":id}));
     assert_eq!(invoke(&window, "get_all_tasks", json!({})), json!([]));
+}
+
+#[test]
+#[ignore = "read-only check against FN_SYNC_TEST_DB with existing sync logs"]
+fn saved_sync_logs_are_visible_with_actual_ui_date_payload() {
+    let path = std::env::var("FN_SYNC_TEST_DB").expect("existing sync database path");
+    assert!(std::path::Path::new(&path).is_file());
+    let db = tauri::async_runtime::block_on(crate::service::database::open_db(
+        std::path::Path::new(&path),
+    ))
+    .unwrap();
+    let state = AppState {
+        db,
+        task_manager: tokio::sync::Mutex::new(crate::task_manager::TaskManager::new()),
+        last_auth_result: parking_lot::Mutex::new(None),
+        oauth_proxy: parking_lot::Mutex::new(None),
+        traffic: crate::traffic::TrafficCounter::new(),
+    };
+    let app = mock_builder()
+        .manage(state)
+        .invoke_handler(tauri::generate_handler![
+            commands::query_logs,
+            commands::export_log_file
+        ])
+        .build(mock_context(noop_assets()))
+        .unwrap();
+    let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    let result = invoke(
+        &window,
+        "query_logs",
+        json!({"params":{"isDir":null,"keyword":"","taskId":null,"status":null,"actionCode":null,"pageSize":25,"startTime":"","endTime":"","page":1}}),
+    );
+    let total = result["total"].as_i64().unwrap();
+    assert!(total > 0, "expected saved sync records");
+    assert_eq!(
+        result["list"].as_array().unwrap().len(),
+        total.min(25) as usize
+    );
+    let start = (crate::service::database::now_ms() - 7 * 86_400_000).to_string();
+    let dated = invoke(
+        &window,
+        "query_logs",
+        json!({"params":{"startTime":start,"endTime":"","pageSize":25,"page":1}}),
+    );
+    assert!(
+        dated["total"].as_i64().unwrap() > 0,
+        "recent sync logs missing with string timestamp filter"
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let archive = invoke(
+        &window,
+        "export_log_file",
+        json!({"path":temp.path().join("existing-sync-logs.tar.gz")}),
+    );
+    let archive = archive.as_str().unwrap();
+    let exported = std::process::Command::new("tar")
+        .arg("-xOzf")
+        .arg(archive)
+        .arg("sync-logs.jsonl")
+        .output()
+        .unwrap();
+    assert!(exported.status.success());
+    let count = String::from_utf8(exported.stdout).unwrap().lines().count();
+    assert!(count > 0, "export contained no saved sync records");
+    eprintln!("Verified real sync log export: {count} records");
+    eprintln!(
+        "Verified saved sync logs: {total}; first page: {}",
+        result["list"].as_array().unwrap().len()
+    );
 }

@@ -4,14 +4,14 @@
   "result": "passed for tested scope",
   "checks": {
     "ipc_static": {
-      "calls": 81,
+      "calls": 82,
       "commands": 89,
       "result": "pass"
     },
     "unit_and_actual_tauri_ipc": {
-      "passed": 57,
+      "passed": 59,
       "failed": 0,
-      "live_tests_excluded_from_unit_run": 5
+      "live_tests_excluded_from_unit_run": 6
     },
     "live_nas": {
       "passed": 5,
@@ -27,7 +27,8 @@
         "filter rules tab",
         "selective sync tab",
         "log page with entries",
-        "application settings page"
+        "application settings page",
+        "settings export save path and unsupported update dialog"
       ],
       "page_exceptions": 0
     },
@@ -44,6 +45,29 @@
       "result": "pass",
       "address": "nas.example.com:5667",
       "writes": "verified renewed access token saved to local account database"
+    },
+    "real_saved_logs": {
+      "result": "pass",
+      "records": 67,
+      "first_page": 25,
+      "exported_records": 67,
+      "request_dates": [
+        "empty strings",
+        "millisecond strings"
+      ],
+      "test_writes": "temporary archive only; existing database read-only"
+    },
+    "settings_behavior": {
+      "result": "pass",
+      "coverage": [
+        "speed settings apply to running transfers without restart",
+        "log retention applies immediately and periodically",
+        "zero retention values mean unlimited",
+        "gzip export contains sync-logs.jsonl and runtime logs",
+        "export path selection, success and failure feedback",
+        "manual check update explicitly unsupported; automatic update disabled",
+        "autostart file test isolated from user configuration"
+      ]
     }
   },
   "live_coverage": [
@@ -69,11 +93,11 @@
   ],
   "unsupported_or_not_exercised": [
     "Linux on-demand placeholders are unsupported and disabled; ordinary sync is used",
-    "vendor automatic update download/install not executed",
     "system login/reboot and autostart launch not exercised",
     "FN Connect relay/fnid not implemented; direct IP/hostname connections used",
     "Kylin 2303/2403/3503, UOS1070 and ARM/LoongArch require native build/runtime validation",
-    "LAN mDNS device discovery on target customer networks not exercised; IPC routing tested"
+    "LAN mDNS device discovery on target customer networks not exercised; IPC routing tested",
+    "Checking/installing updates intentionally unsupported per user request; UI reports unsupported"
   ],
   "safety_bounds": "Only dedicated fn-sync-qa NAS directories and temporary local files were modified by live tests; normal task files were not used as test fixtures",
   "reproduce": {

@@ -75,3 +75,13 @@ FN_SYNC_UI_FIXTURES=/tmp/fn-ui-fixtures.json node scripts/qa-ui-smoke.cjs
 ```
 
 当前验证机器为 x86_64 Linux。麒麟/UOS 的指定版本、ARM/龙芯等目标架构仍需在对应系统上构建和运行验证。
+
+
+## 日志与设置
+
+日志日期筛选接受界面提交的空字符串和毫秒时间字符串。日志数量/天数为 0 表示不限；
+修改保存规则立即执行清理，运行中每分钟维护一次。全局上传/下载限速修改后立即应用。
+“导出日志文件”先选择保存位置，再生成 gzip 归档，内含 `sync-logs.jsonl` 和运行日志。
+检查更新与自动更新当前不接入，界面会提示暂不支持。
+`saved_sync_logs_are_visible_with_actual_ui_date_payload` 是只读实库检查，需要已有同步日志；
+它会在临时目录验证实际导出内容。

@@ -15,7 +15,7 @@ pub const DATABASE_MIGRATIONS: &[&str] = &[
     );
     INSERT INTO system_table (key, value) VALUES
         ('is_complete_first_run', '0'),
-        ('auto_update', '1'),
+        ('auto_update', '0'),
         ('log_save_day', '360'),
         ('log_save_size', '1000000');
     INSERT OR IGNORE INTO system_table (key, value) VALUES ('language', '');
