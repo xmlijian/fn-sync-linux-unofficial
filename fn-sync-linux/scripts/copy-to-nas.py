@@ -97,17 +97,17 @@ class Session:
     def copy(self, local, folder):
         data = local.read_bytes()
         remote = folder.rstrip('/') + '/' + local.name
-        result = self.rpc({'req': 'file.checkUpload', 'path': remote, 'size': len(data), 'overwrite': False})
+        result = self.rpc({'req': 'file.checkUpload', 'path': remote, 'size': len(data), 'overwrite': True})
         if result.get('result') != 'succ':
             raise RuntimeError('NAS upload preparation failed')
         name = result.get('uploadName', local.name)
-        remote = folder.rstrip('/') + '/' + name
-        encoded = urllib.parse.quote(remote, safe="/-_.!~*'()")
+        upload_path = folder.rstrip('/') + '/' + name
+        encoded = urllib.parse.quote(upload_path, safe="/-_.!~*'()")
         boundary = 'fn-sync-' + os.urandom(12).hex()
         body = (f'--{boundary}\r\nContent-Disposition: form-data; name="trim-upload-file"; filename="{name}"\r\nContent-Type: application/octet-stream\r\n\r\n').encode() + data + f'\r\n--{boundary}--\r\n'.encode()
         req = urllib.request.Request('https://' + self.address + '/upload', data=body, headers={
             'Content-Type': 'multipart/form-data; boundary=' + boundary,
-            'Trim-Path': encoded, 'Trim-From': '0', 'Trim-Overwrite': 'false',
+            'Trim-Path': encoded, 'Trim-From': '0', 'Trim-Overwrite': 'true',
             'Trim-Mtim': str(int(time.time())), 'Trim-Token': self.account['token'],
             'Trim-Sign': self.signature(encoded), 'Authorization': 'trim ' + self.account['token'],
         })
