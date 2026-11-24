@@ -22,6 +22,7 @@ import os
 import sys
 import subprocess
 import threading
+import time
 from urllib.parse import unquote, urlparse
 import gi
 try:
@@ -113,6 +114,10 @@ class FnSyncStatusExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.Men
         # 必须强引用 file_info：弱引用可能在 Nautilus 释放 wrapper 后失效，
         # 导致状态变化后角标不再刷新。
         self._files = {}
+        # 最后一次见到该路径的时间（monotonic）。守护进程重启或目录尚未
+        # 加载时，快照会短暂缺少已显示文件；不能立刻丢掉强引用，否则重连
+        # 后无法 invalidate，图标会停在旧状态（与右键菜单不一致）。
+        self._last_seen = {}
         self._busy = False
         GLib.timeout_add(1000, self._refresh)
 
@@ -156,10 +161,16 @@ class FnSyncStatusExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.Men
                 _notify("上传失败", f'{name}\n{after["error"]}')
             else:
                 _notify("上传完成", name)
-        # 强引用只保留当前仍存在的文件，避免长期累积。
+        now = time.monotonic()
+        for path in new:
+            self._last_seen[path] = now
+        # 超过 10 分钟仍未出现的条目才清理。守护进程重启、NAS 重连、目录
+        # 尚未展开都会让快照短暂缺少文件；过早丢弃 file_info 会导致图标
+        # 停在旧状态，而右键菜单实时读快照、看起来“不一致”。
         for path in list(self._files):
-            if path not in new:
+            if path not in new and now - self._last_seen.get(path, now) > 600:
                 self._files.pop(path, None)
+                self._last_seen.pop(path, None)
         for path in changed:
             info = self._files.get(path)
             if info:
@@ -172,6 +183,7 @@ class FnSyncStatusExtension(GObject.GObject, Nautilus.InfoProvider, Nautilus.Men
         if not path:
             return Nautilus.OperationResult.COMPLETE
         self._files[path] = file_info
+        self._last_seen[path] = time.monotonic()
         emblem = EMBLEMS.get(_base_state(path))
         if emblem:
             file_info.add_emblem(emblem)

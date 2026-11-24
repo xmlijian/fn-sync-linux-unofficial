@@ -99,7 +99,7 @@ FN_SYNC_UI_FIXTURES=/tmp/fn-ui-fixtures.json node scripts/qa-ui-smoke.cjs
 - 本地写入落缓存并异步上传（三步上传协议），flush 后由 worker 重试直至成功
 - 远端变化（6s 根目录差异轮询）实时反映；远端已变化而本地基于旧版本修改 → NAS 侧保留双方（Conflicted Copy）
 - 右键菜单：文件支持下载 / 释放 / 始终保留；文件夹支持整目录下载 / 释放 / 保留。文件夹的“保留”是一次性动作，只对点击时已有的文件生效，之后新增的文件不会自动保留
-- 编辑器原子保存（临时文件 + rename）已支持：`.goutputstream-*` 等临时文件只留本地，改名为正式文件前不会上传
+- 编辑器原子保存（临时文件 + rename）已支持：`.goutputstream-*`、`文件名.~#N` 等临时文件只留本地，改名为正式文件前不会上传；`文件名.~#N` 备份不会被自动删除
 - 缓存 LRU 淘汰（默认上限 10 GiB，system_table `ondemand_cache_limit_bytes` 可覆盖），等价官方“释放电脑磁盘”
 - 崩溃/重启后未上传的修改自动补传（缓存目录 `.meta.json`）
 - 删除任务时清理缓存；存在未上传修改则保留并告警
