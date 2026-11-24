@@ -106,12 +106,24 @@ pub fn snapshot(shared: &Shared) -> Value {
                 return None;
             }
             let transfer = shared.transfers.get(&node.rel);
+            let (done, total, progress, speed, eta) = match transfer.as_ref() {
+                Some(t) => {
+                    let (speed, eta) = t.speed_and_eta();
+                    (
+                        t.done.load(Ordering::Relaxed),
+                        t.total,
+                        t.percent(),
+                        speed,
+                        eta,
+                    )
+                }
+                None => (0, node.size, 0, 0, None),
+            };
             Some(
                 json!({"path":node.rel,"state":shared.file_state(&node),"size":node.size,
             "pinned":shared.pins.contains_key(&node.rel),
-            "done":transfer.as_ref().map(|t|t.done.load(Ordering::Relaxed)).unwrap_or(0),
-            "total":transfer.as_ref().map(|t|t.total).unwrap_or(node.size),
-            "progress":transfer.as_ref().map(|t|t.percent()).unwrap_or(0),
+            "done":done,"total":total,"progress":progress,
+            "speed":speed,"eta":eta,
             "error":shared.errors.get(&node.rel).map(|e|e.value().clone())}),
             )
         })
@@ -178,10 +190,40 @@ async fn handle(shared: &Arc<Shared>, request: Request) -> Result<Value> {
         anyhow::bail!("请选择文件；目录批量操作需逐文件执行");
     }
     match request.action.as_str() {
-        "free" => shared.release(&rel)?,
-        "unpin" => shared.set_pin(&rel, false)?,
+        "free" => {
+            if shared.releasing.contains_key(&rel) {
+                return Ok(json!({"accepted":true,"path":rel}));
+            }
+            // 释放本身只是 unlink，通常瞬时；但「被占用/有修改/已保留」的失败
+            // 必须能通过状态暴露给 CLI（通知横幅可能被系统关闭）。
+            shared.releasing.insert(rel.clone(), ());
+            shared.errors.remove(&rel);
+            let s = shared.clone();
+            let name = rel.clone();
+            if !shared.transfer_ops.submit(
+                "control-free",
+                Box::new(move || {
+                    if let Err(error) = s.release(&name) {
+                        s.errors.insert(name.clone(), error.to_string());
+                    }
+                    s.releasing.remove(&name);
+                    if let Some(ino) = s.ino_by_rel.get(&name).map(|v| *v) {
+                        s.notify_inode(ino);
+                    }
+                }),
+            ) {
+                shared.releasing.remove(&rel);
+                anyhow::bail!("传输队列已满，请稍后再试");
+            }
+            return Ok(json!({"accepted":true,"path":rel}));
+        }
+        "unpin" => {
+            shared.errors.remove(&rel);
+            shared.set_pin(&rel, false)?;
+        }
         "download" | "pin" => {
             if request.action == "pin" {
+                shared.errors.remove(&rel);
                 shared.set_pin(&rel, true)?;
             }
             if shared.queued_downloads.contains_key(&rel) || shared.transfers.contains_key(&rel) {
@@ -310,9 +352,61 @@ mod integration_tests {
         .await
         .unwrap();
         assert_eq!(rpc(&shared, "pin", "a.txt").await["ok"], true);
-        assert_eq!(rpc(&shared, "free", "a.txt").await["ok"], false);
+        // 释放改为异步执行：pinned 的拒绝要通过状态里的 error 暴露。
+        // pin 会对已缓存文件再做一次 hydrate 检查、短暂持有缓存锁，因此这里
+        // 允许重试：只有确认是“始终保留”的拒绝才算数。
+        let mut pinned_error = String::new();
+        for _ in 0..50 {
+            assert_eq!(rpc(&shared, "free", "a.txt").await["ok"], true);
+            pinned_error = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let state = rpc(&shared, "status", "").await;
+                    if let Some(err) = state["result"]["files"][0]["error"].as_str() {
+                        break err.to_string();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            if pinned_error.contains("始终保留") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(pinned_error.contains("始终保留"), "{pinned_error}");
+        assert!(shared.cache.file_path("a.txt").exists());
         assert_eq!(rpc(&shared, "unpin", "a.txt").await["ok"], true);
-        assert_eq!(rpc(&shared, "free", "a.txt").await["ok"], true);
+        let mut released = false;
+        for _ in 0..50 {
+            assert_eq!(rpc(&shared, "free", "a.txt").await["ok"], true);
+            let outcome = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let state = rpc(&shared, "status", "").await;
+                    let file = &state["result"]["files"][0];
+                    if let Some(err) = file["error"].as_str() {
+                        break Err(err.to_string());
+                    }
+                    if file["state"] == "placeholder" {
+                        break Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            match outcome {
+                Ok(()) => {
+                    released = true;
+                    break;
+                }
+                Err(err) if err.contains("正在传输") => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(err) => panic!("{err}"),
+            }
+        }
+        assert!(released, "file never reached placeholder");
         assert!(!shared.cache.file_path("a.txt").exists());
         assert_eq!(
             rpc(&shared, "status", "").await["result"]["files"][0]["state"],
@@ -322,6 +416,32 @@ mod integration_tests {
         shared.stopping.store(true, Ordering::Relaxed);
         assert_eq!(rpc(&shared, "download", "a.txt").await["ok"], false);
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_reports_speed_and_eta() {
+        let (_tmp, shared) = fixture().await;
+        let _ = resolve(&shared, "a.txt").await.unwrap();
+        shared.transfers.insert(
+            "a.txt".into(),
+            crate::tasks::ondemand::fs::Transfer {
+                kind: "download",
+                total: 1000,
+                done: Arc::new(std::sync::atomic::AtomicU64::new(500)),
+                started: std::time::Instant::now() - Duration::from_secs(2),
+            },
+        );
+        let snap = snapshot(&shared);
+        let file = snap["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == "a.txt")
+            .unwrap();
+        assert_eq!(file["state"], "download");
+        let speed = file["speed"].as_u64().unwrap();
+        assert!((240..=260).contains(&speed), "speed={speed}");
+        assert_eq!(file["eta"].as_u64(), Some(2));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn release_refuses_locked_and_dirty_content() {
         let (_tmp, shared) = fixture().await;

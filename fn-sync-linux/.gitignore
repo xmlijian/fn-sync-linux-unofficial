@@ -10,3 +10,6 @@ artifacts/
 .env
 
 __pycache__/
+
+# oh-my-claudecode / oh-my-codex 状态
+.omc/

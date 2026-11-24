@@ -661,6 +661,116 @@ mod mount_tests {
         }
     }
 
+    /// 回归：编辑器原子保存 = 创建 .goutputstream-* 临时文件 → 写入 → rename 成目标。
+    /// 旧实现会先上传临时文件、再删掉 overlay 记录，点文件过滤又让源路径不可解析，
+    /// 最终 rename 报 ENOENT（“重命名临时文件出错：没有那个文件或目录”）。
+    #[tokio::test]
+    #[ignore = "requires /dev/fuse + fusermount3; run with FN_SYNC_FUSE_TEST=1"]
+    async fn atomic_save_via_dotfile_rename_works() {
+        if std::env::var("FN_SYNC_FUSE_TEST").as_deref() != Ok("1") {
+            eprintln!("SKIP: set FN_SYNC_FUSE_TEST=1 to run the real mount test");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mountpoint = tmp.path().join("mnt");
+        std::fs::create_dir_all(&mountpoint).unwrap();
+        let nas = Arc::new(FakeNas::new());
+        nas.seed_dir("root");
+        nas.seed("root/target.txt", b"old");
+        let cfg = make_cfg(mountpoint.clone(), tmp.path().join("cache"));
+        let db = database::open_db(&tmp.path().join("db.sqlite"))
+            .await
+            .unwrap();
+        database::migrate(&db).await.unwrap();
+        let filter = FileFilter::from_db(None);
+        let mount = OnDemandMount::start(cfg, nas.clone() as Arc<dyn RemoteOps>, db, filter)
+            .expect("mount started");
+
+        // 等目标文件出现在挂载里，确保它的远端戳被解析。
+        assert!(
+            wait_until(9000, || mountpoint.join("target.txt").exists()).await,
+            "target visible"
+        );
+
+        // 覆盖已有文件：临时文件 .goutputstream-* → rename 成 target.txt
+        std::fs::write(mountpoint.join(".goutputstream-test"), b"new content").unwrap();
+        assert!(
+            mountpoint.join(".goutputstream-test").exists(),
+            "scratch file must be visible before rename"
+        );
+        std::fs::rename(
+            mountpoint.join(".goutputstream-test"),
+            mountpoint.join("target.txt"),
+        )
+        .expect("atomic-save rename must not fail");
+
+        assert_eq!(
+            std::fs::read(mountpoint.join("target.txt")).unwrap(),
+            b"new content",
+            "target must show new content immediately"
+        );
+        assert!(
+            wait_until(9000, || nas.read("root/target.txt").as_deref()
+                == Some(&b"new content"[..]))
+            .await,
+            "target must be uploaded to NAS"
+        );
+        assert!(
+            !nas.exists("root/.goutputstream-test"),
+            "scratch file must never be uploaded to NAS"
+        );
+
+        // 新建文件：同样通过临时文件 + rename
+        std::fs::write(mountpoint.join(".goutputstream-new"), b"brand new").unwrap();
+        std::fs::rename(
+            mountpoint.join(".goutputstream-new"),
+            mountpoint.join("new.txt"),
+        )
+        .expect("atomic-save rename for new file");
+        assert_eq!(
+            std::fs::read(mountpoint.join("new.txt")).unwrap(),
+            b"brand new"
+        );
+        assert!(
+            wait_until(9000, || nas.read("root/new.txt").as_deref()
+                == Some(&b"brand new"[..]))
+            .await,
+            "new file must be uploaded"
+        );
+        assert!(!nas.exists("root/.goutputstream-new"));
+
+        // WPS 风格：文件名.~#N → 正式文件
+        std::fs::write(mountpoint.join("wps.txt"), b"wps old").unwrap();
+        assert!(
+            wait_until(9000, || nas.read("root/wps.txt").as_deref()
+                == Some(&b"wps old"[..]))
+            .await,
+            "wps target uploaded"
+        );
+        std::fs::write(mountpoint.join("wps.txt.~#1"), b"wps new").unwrap();
+        std::fs::rename(
+            mountpoint.join("wps.txt.~#1"),
+            mountpoint.join("wps.txt"),
+        )
+        .expect("wps-style atomic save must not fail");
+        assert_eq!(
+            std::fs::read(mountpoint.join("wps.txt")).unwrap(),
+            b"wps new"
+        );
+        assert!(
+            wait_until(9000, || nas.read("root/wps.txt").as_deref()
+                == Some(&b"wps new"[..]))
+            .await,
+            "wps target must be uploaded"
+        );
+        assert!(
+            !nas.exists("root/wps.txt.~#1"),
+            "wps scratch file must never be uploaded"
+        );
+
+        mount.stop().unwrap();
+    }
+
     /// 回归测试：单个慢远端请求不能让整棵挂载树失去响应。
     /// 这是用户实际遇到的症状（目录卡死、无法读写）。
     #[tokio::test]

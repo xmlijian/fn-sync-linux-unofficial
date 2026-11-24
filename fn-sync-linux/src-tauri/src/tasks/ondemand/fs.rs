@@ -26,6 +26,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -88,6 +89,9 @@ struct Overlay {
     created: BTreeMap<String, u64>,
     /// 本地删除（远端删除进行中/失败重试）
     deleted: HashSet<String>,
+    /// 本地临时文件（编辑器原子保存的 .goutputstream-* 等）：内容只留本地，
+    /// 不上传；改名成正式文件时由 rename 标记目标上传。
+    scratch: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +238,25 @@ impl Transfer {
         }
         (self.done.load(Ordering::Relaxed).saturating_mul(100) / self.total).min(100)
     }
+
+    /// 平均速度（字节/秒）与预计剩余秒数（未知时为 None）。
+    ///
+    /// 用「已传字节 / 已耗时」的平均速率，足够稳定且不会因为网络抖动
+    /// 让进度窗里的剩余时间剧烈跳动。
+    pub fn speed_and_eta(&self) -> (u64, Option<u64>) {
+        let done = self.done.load(Ordering::Relaxed);
+        let elapsed = self.started.elapsed().as_secs_f64();
+        if done == 0 || elapsed <= 0.0 {
+            return (0, None);
+        }
+        let speed = (done as f64 / elapsed) as u64;
+        let eta = if self.total > done && speed > 0 {
+            Some((self.total - done) / speed)
+        } else {
+            None
+        };
+        (speed, eta)
+    }
 }
 
 pub struct Shared {
@@ -281,6 +304,8 @@ pub struct Shared {
     pub transfer_ops: Arc<OpPool>,
     pub errors: DashMap<String, String>,
     pub queued_downloads: DashMap<String, ()>,
+    /// 正在执行「释放空间」的路径；状态列显示「释放中…」。
+    pub releasing: DashMap<String, ()>,
     pub control_slots: tokio::sync::Semaphore,
     read_slots: Arc<tokio::sync::Semaphore>,
     range_slots: tokio::sync::Semaphore,
@@ -327,6 +352,7 @@ impl Shared {
             transfer_ops: Arc::new(OpPool::new(8)),
             errors: DashMap::new(),
             queued_downloads: DashMap::new(),
+            releasing: DashMap::new(),
             control_slots: tokio::sync::Semaphore::new(4),
             read_slots: Arc::new(tokio::sync::Semaphore::new(128)),
             range_slots: tokio::sync::Semaphore::new(4),
@@ -384,6 +410,33 @@ impl Shared {
             Some(first) => first == ".Trash" || first.starts_with(".Trash-"),
             None => false,
         }
+    }
+
+    /// 编辑器临时文件（.goutputstream-*、.~lock.*、~$*、#*# 等）以及同步过滤
+    /// 规则命中的本地文件。按需挂载把它们当作 scratch：内容只留本地，不参与上传。
+    /// 用 size=None 调用过滤，避免文件大小上下限把用户正常新建的文件误判为临时文件。
+    fn is_scratch(&self, rel: &str) -> bool {
+        is_scratch_name(Self::file_name(rel)) || !self.filter.should_sync(rel, None)
+    }
+
+    /// 这个文件是否是“本次由本地创建、且未参与同步”的 scratch。
+    /// 与 is_scratch 的区别：远端原本就存在的 `file.~#N` 备份不是本地 scratch，
+    /// 它需要按正常文件参与改名/上传，不能被当成临时文件吞掉。
+    fn is_local_scratch(&self, rel: &str) -> bool {
+        let name = Self::file_name(rel);
+        let parent_rel = Self::parent_rel(rel);
+        let parent_ino = if parent_rel.is_empty() {
+            ROOT_INO
+        } else {
+            match self.ino_by_rel.get(parent_rel) {
+                Some(v) => *v,
+                None => return false,
+            }
+        };
+        self.overlays
+            .get(&parent_ino)
+            .map(|ov| ov.read().scratch.contains(name))
+            .unwrap_or(false)
     }
 
     /// 本地目录的磁盘位置（缓存根下同名路径）
@@ -516,7 +569,7 @@ impl Shared {
 
     /// 请求内核刷新 inode 属性（状态列、大小等），并触发一次属性变更事件，
     /// 让文件管理器的状态列自动刷新。
-    fn notify_inode(&self, ino: u64) {
+    pub(crate) fn notify_inode(&self, ino: u64) {
         let _ = self.notify_tx.try_send(NotifyMsg::Inode { ino });
         // UI consumes daemon status directly; never re-enter the FUSE mount to touch files.
     }
@@ -1005,6 +1058,10 @@ impl Shared {
         if node.kind == FileType::Directory {
             return "directory";
         }
+        // 释放是异步的：先给出「释放中」，避免用户点完没有任何反馈
+        if self.releasing.contains_key(&node.rel) {
+            return "releasing";
+        }
         // 传输中优先展示：这是用户最需要看到的即时反馈
         if let Some(t) = self.transfers.get(&node.rel) {
             return t.kind; // "download" | "upload"
@@ -1093,19 +1150,22 @@ impl Shared {
             .ok_or_else(|| anyhow!("no inode"))?
             .read()
             .stamp;
+        let scratch = self.is_local_scratch(&rel);
         self.cache.ensure_state(&rel, stamp, now);
         self.cache.update(&rel, |s| {
             s.size = size;
-            s.dirty = true;
+            s.dirty = !scratch;
             s.mtime = now;
         });
         if let Some(inode) = self.inodes.get(&ino) {
             let mut node = inode.write();
-            node.dirty = true;
+            node.dirty = !scratch;
             node.size = size;
             node.mtime = now;
         }
-        self.mark_meta_dirty();
+        if !scratch {
+            self.mark_meta_dirty();
+        }
         self.notify_inode(ino);
         Ok(())
     }
@@ -1114,20 +1174,10 @@ impl Shared {
     /// never materialize multi-GB files after the user explicitly freed local content.
     /// Ranges are only a bounded memory cache and do not change the downloaded state.
     pub async fn read_placeholder(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>> {
-        let rel = self
-            .inodes
-            .get(&ino)
-            .ok_or_else(|| anyhow!("no inode"))?
-            .read()
-            .rel
-            .clone();
-        let lock = self.cache.lock_for(&rel);
-        // Serialize with resize/write/upload, but never wait a full ISO hydration.
-        let _guard = tokio::select! {
-            result = tokio::time::timeout(Duration::from_secs(1), lock.lock()) =>
-                result.map_err(|_| anyhow!(std::io::Error::from_raw_os_error(libc::EAGAIN)))?,
-            _ = self.wait_stopping() => anyhow::bail!("挂载正在停止"),
-        };
+        // 不抢按文件的缓存锁：range 读取只访问远端，从不写本地缓存文件。
+        // hydrate（整文件下载）会把同一把锁持有到下载结束；此前这里只等 1 秒，
+        // 导致“下载到本地”期间任何读取/复制/MIME 探测都会 EAGAIN（资源暂时不可用）。
+        // 与写入/截断的并发由下面的 dirty 标记兜底，FUSE 语义允许读写并发竞争。
         let node = self
             .inodes
             .get(&ino)
@@ -1304,6 +1354,23 @@ impl Shared {
         if Self::is_local_only(&rel) {
             return Ok(());
         }
+        // 本地创建、未参与同步的编辑器临时文件只留本地，绝不传到 NAS。
+        // 注意用 is_local_scratch：远端已有的 `file.~#N` 备份不是 scratch，
+        // 它需要正常上传（可能是用户唯一的旧版本）。
+        if self.is_local_scratch(&rel) {
+            if self.cache.state(&rel).map(|s| s.dirty).unwrap_or(false) {
+                self.cache.update(&rel, |s| s.dirty = false);
+            }
+            if let Some(inode) = self.inodes.get(&ino) {
+                inode.write().dirty = false;
+            }
+            return Ok(());
+        }
+        // 干净文件（只读打开后的 close 也会触发 flush → 这里）不进入锁等待。
+        // hydrate 会长时间持有该锁，否则每次 close 都要白等 30 秒才放弃。
+        if !self.cache.state(&rel).map(|s| s.dirty).unwrap_or(false) {
+            return Ok(());
+        }
         let lock = self.cache.lock_for(&rel);
         // 同一文件的上传可能被 flush / worker / fsync 并发触发；
         // 若前一次上传卡在网络上，后续请求不能无限排队（会让 close/fsync 挂住）。
@@ -1382,6 +1449,10 @@ impl Shared {
     }
 
     async fn do_upload(&self, rel: &str, stamp: &(u64, i64)) -> Result<(u64, i64)> {
+        // 防御：本地 scratch 只能作为改名后的正式文件上传，不以临时名进入 NAS。
+        if self.is_local_scratch(rel) {
+            anyhow::bail!("临时文件不参与同步");
+        }
         let path = self.cache.file_path(rel);
         let bytes = std::fs::read(&path)?;
         let mtime = std::fs::metadata(&path)
@@ -1461,6 +1532,51 @@ impl Shared {
         Ok(())
     }
 
+    /// 清理旧版本误上传的编辑器临时文件（.goutputstream-* 等）。
+    ///
+    /// 旧逻辑会把它们当普通新建文件上传，然后因为点文件过滤导致改名失败。
+    /// 现在改为从不它们参与同步；这里把历史残留从本地缓存和 NAS 一起删掉。
+    /// 只处理缓存里存在且 mtime 超过 60 秒的文件，避免删掉正在保存的临时文件。
+    async fn purge_scratch_leftovers(&self) {
+        let root = self.cache.root().to_path_buf();
+        let mut files = Vec::new();
+        collect_scratch_files(&root, &root, &mut files);
+        let now = std::time::SystemTime::now();
+        for (rel, path) in files {
+            let name = Self::file_name(&rel);
+            // .swp 可能是 Vim 正在使用的交换文件，给它更长的过期时间；
+            // 其余编辑器临时文件（.goutputstream-* / .~* / ~$* / #*#）超过
+            // 60 秒仍未改名，基本可以确定是失败保存留下的孤儿。
+            let age_limit = if name.ends_with(".swp") { 24 * 3600 } else { 60 };
+            let stale = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| now.duration_since(t).ok())
+                .map(|d| d.as_secs() >= age_limit)
+                .unwrap_or(false);
+            if !stale {
+                continue;
+            }
+            let remote = self.remote_path(&rel);
+            if let Err(e) = self.nas.remove(&[remote]).await {
+                tracing::debug!(rel = %rel, error = %e, "scratch remote cleanup skipped");
+            }
+            let _ = std::fs::remove_file(&path);
+            self.cache.remove(&rel);
+            if !self.is_in_use(&rel) {
+                self.drop_inode(&rel);
+            } else {
+                self.ino_by_rel.remove(&rel);
+            }
+            for ov in self.overlays.iter() {
+                let mut ov = ov.write();
+                ov.created.remove(name);
+                ov.scratch.remove(name);
+            }
+            tracing::info!(rel = %rel, "purged stale editor scratch file");
+        }
+    }
+
     fn invalidate_parent_listing(&self, parent: u64) {
         self.dir_cache.remove(&parent);
     }
@@ -1484,6 +1600,11 @@ impl Shared {
                 if let Err(e) = self.purge_remote_reserved().await {
                     tracing::debug!(error = %e, "purge remote reserved skipped");
                 }
+            }
+            // 清理旧版本误上传的编辑器临时文件；每 60s 复查，确保刚过期
+            // 的临时文件也能被清掉（只扫本地缓存，代价很小）。
+            if tick == 1 || tick % 30 == 0 {
+                self.purge_scratch_leftovers().await;
             }
             self.flush_meta();
             self.flush_dirty_uploads();
@@ -1749,20 +1870,25 @@ async fn apply_write(shared: &Shared, ino: u64, off: u64, data: &[u8]) -> Result
         .unwrap_or_else(|| shared.inodes.get(&ino).map(|n| n.read().size).unwrap_or(0));
     let new_size = std::cmp::max(off + data.len() as u64, existing);
     let now = now_secs();
+    // 编辑器临时文件（.goutputstream-* 等）：内容只留本地，不改脏、不触发上传。
+    // 改名成正式文件时由 do_rename 把目标标记为脏。
+    let scratch = shared.is_local_scratch(&rel);
     // 写未缓存的占位文件时先补状态记录（内容不对应任何远端版本 → stamp (0,0)）
     shared.cache.ensure_state(&rel, (0, 0), now);
     shared.cache.update(&rel, |s| {
         s.size = new_size;
-        s.dirty = true;
+        s.dirty = !scratch;
         s.mtime = now;
     });
     if let Some(inode) = shared.inodes.get(&ino) {
         let mut node = inode.write();
-        node.dirty = true;
+        node.dirty = !scratch;
         node.size = new_size;
         node.mtime = now;
     }
-    shared.mark_meta_dirty();
+    if !scratch {
+        shared.mark_meta_dirty();
+    }
     Ok(())
 }
 
@@ -2561,12 +2687,20 @@ impl Shared {
             return Ok(ino);
         }
         let exists_remotely = entries.iter().any(|e| e.name == name_s);
+        // 编辑器原子保存会先建 .goutputstream-* 这类临时文件再改名。它们命中
+        // 同步过滤规则时只留本地、不参与上传，改名成正式文件时再由 rename 处理。
+        let scratch = self.is_scratch(&rel);
         let ino = self.get_or_alloc(&rel, FileType::RegularFile);
         {
             let inode = self.inodes.get(&ino).ok_or_else(|| anyhow!("no inode"))?;
             let mut node = inode.write();
             node.created = true;
-            if !node.dirty {
+            if scratch {
+                node.dirty = false;
+                node.size = 0;
+                node.mtime = now_secs();
+                node.stamp = (0, 0);
+            } else if !node.dirty {
                 node.dirty = true;
                 node.size = 0;
                 node.mtime = now_secs();
@@ -2589,7 +2723,7 @@ impl Shared {
                 &rel,
                 CacheState {
                     size: 0,
-                    dirty: true,
+                    dirty: !scratch,
                     uploading: false,
                     stamp: (0, 0),
                     mtime: now_secs(),
@@ -2601,25 +2735,27 @@ impl Shared {
             // 任何远端版本（stamp (0,0)），上传时触发保双方
             self.cache.remove(&rel);
             self.cache.ensure_state(&rel, (0, 0), now_secs());
+            if scratch {
+                self.cache.update(&rel, |s| s.dirty = false);
+            }
         }
-        self.overlays
-            .entry(parent)
-            .or_default()
-            .write()
-            .deleted
-            .remove(&name_s);
-        if !exists_remotely {
-            self.overlays
-                .entry(parent)
-                .or_default()
-                .write()
-                .created
-                .insert(name_s, ino);
+        {
+            let entry = self.overlays.entry(parent).or_default();
+            let mut ov = entry.write();
+            ov.deleted.remove(&name_s);
+            if !exists_remotely {
+                ov.created.insert(name_s.clone(), ino);
+                if scratch {
+                    ov.scratch.insert(name_s);
+                }
+            }
         }
         self.invalidate_parent_listing(parent);
         // 注意：不得在请求处理路径中发内核失效通知（会与待处理请求互相等待导致死锁），
         // 目录可见性由 TTL 与 worker 轮询保证。
-        self.mark_meta_dirty();
+        if !scratch {
+            self.mark_meta_dirty();
+        }
         Ok(ino)
     }
 
@@ -2714,7 +2850,9 @@ impl Shared {
             .unwrap_or(false);
         if was_created {
             if let Some(ov) = self.overlays.get(&parent) {
-                ov.write().created.remove(&name_s);
+                let mut ov = ov.write();
+                ov.created.remove(&name_s);
+                ov.scratch.remove(&name_s);
             }
             let _ = std::fs::remove_file(self.cache.file_path(&rel));
             self.cache.remove(&rel);
@@ -2724,12 +2862,12 @@ impl Shared {
         }
         // 本地删除 + 远端删除（worker 重试）
         self.pending_removes.insert(rel.clone(), 0);
-        self.overlays
-            .entry(parent)
-            .or_default()
-            .write()
-            .deleted
-            .insert(name_s.clone());
+        {
+            let entry = self.overlays.entry(parent).or_default();
+            let mut ov = entry.write();
+            ov.deleted.insert(name_s.clone());
+            ov.scratch.remove(&name_s);
+        }
         let _ = std::fs::remove_file(self.cache.file_path(&rel));
         self.cache.remove(&rel);
         self.mark_meta_dirty();
@@ -2904,6 +3042,19 @@ impl Shared {
             self.invalidate_parent_listing(parent);
             return Ok(());
         }
+        // 编辑器原子保存：临时文件只留本地；改名成正式文件时把目标标记为脏，
+        // 由 worker 按目标名上传（绝不把 .goutputstream-* 传到 NAS）。
+        // 只对普通文件生效，点开头的目录仍走普通远端改名。
+        let src_kind = self
+            .ino_by_rel
+            .get(&rel)
+            .map(|v| *v)
+            .and_then(|ino| self.inodes.get(&ino).map(|n| n.read().kind));
+        if src_kind == Some(FileType::RegularFile) && self.is_local_scratch(&rel) {
+            return self
+                .rename_scratch(parent, &name_s, &new_s, &rel, &new_rel)
+                .await;
+        }
         let ino = self
             .ino_by_rel
             .get(&rel)
@@ -2959,6 +3110,177 @@ impl Shared {
         self.add_log(logs::ACTION_RENAME, &new_rel, false).await;
         Ok(())
     }
+
+    /// 编辑器临时文件的改名。
+    ///
+    /// 临时文件（.goutputstream-* 等）从不参与上传。改名成正式文件时，把本地
+    /// 内容移到目标缓存路径，并把目标标记为脏，由 worker 按目标名上传；改成
+    /// 另一个临时文件时只做本地改名。
+    async fn rename_scratch(
+        &self,
+        parent: u64,
+        name_s: &str,
+        new_s: &str,
+        rel: &str,
+        new_rel: &str,
+    ) -> Result<()> {
+        let ino = self
+            .ino_by_rel
+            .get(rel)
+            .map(|v| *v)
+            .ok_or_else(|| anyhow!("rename source not found"))?;
+        let dst_scratch = self.is_scratch(new_rel);
+        let old_target_ino = self.ino_by_rel.get(new_rel).map(|v| *v);
+        let target_created_locally = self
+            .overlays
+            .get(&parent)
+            .map(|ov| ov.read().created.contains_key(new_s))
+            .unwrap_or(false);
+        let target_remote = !dst_scratch
+            && !target_created_locally
+            && old_target_ino.filter(|i| *i != ino).is_some();
+        // 覆盖远端已有目标时，以目标原来的远端戳作为冲突检测基准：正常保存是
+        // 覆盖；只有远端在此期间也被改过才保留 Conflicted Copy。
+        let base_stamp = old_target_ino
+            .filter(|i| *i != ino)
+            .and_then(|i| self.inodes.get(&i).map(|n| n.read().stamp))
+            .unwrap_or((0, 0));
+
+        // 与目标文件的上传/释放串行：避免上传任务在 rename 之后用旧内容
+        // 覆盖我们刚写入的缓存并清掉脏标记。
+        let target_lock = self.cache.lock_for(new_rel);
+        let _target_guard = tokio::time::timeout(Duration::from_secs(30), target_lock.lock())
+            .await
+            .map_err(|_| anyhow!("保存等待上传完成超时"))?;
+
+        // 本地缓存文件移动到目标路径（覆盖目标旧缓存）
+        let old_path = self.cache.file_path(rel);
+        let new_path = self.cache.file_path(new_rel);
+        let local_size = std::fs::metadata(&old_path).map(|m| m.len()).unwrap_or(0);
+        if let Some(p) = new_path.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        if old_path.exists() {
+            std::fs::rename(&old_path, &new_path)?;
+        } else if !dst_scratch {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&new_path)?;
+        }
+
+        // 缓存状态迁移到目标：正式文件标记为脏，交给 worker 上传
+        self.cache.remove(rel);
+        self.cache.remove(new_rel);
+        self.cache.set_state(
+            new_rel,
+            CacheState {
+                size: local_size,
+                dirty: !dst_scratch,
+                uploading: false,
+                stamp: if dst_scratch { (0, 0) } else { base_stamp },
+                mtime: now_secs(),
+                last_access_ms: self.cache.now_ms(),
+            },
+        );
+
+        // 源 inode 接管目标名字；目标旧 inode（若存在且未打开）丢弃。
+        if let Some(old) = old_target_ino.filter(|i| *i != ino) {
+            if !self.is_in_use(new_rel) {
+                self.drop_inode(new_rel);
+            } else {
+                self.ino_by_rel.remove(new_rel);
+            }
+            let _ = old;
+        }
+        self.ino_by_rel.remove(rel);
+        self.ino_by_rel.insert(new_rel.to_string(), ino);
+        if let Some(inode) = self.inodes.get(&ino) {
+            let mut node = inode.write();
+            node.rel = new_rel.to_string();
+            node.size = local_size;
+            node.mtime = now_secs();
+            node.created = dst_scratch || !target_remote;
+            node.dirty = !dst_scratch;
+            if !dst_scratch {
+                node.stamp = base_stamp;
+            }
+        }
+
+        // overlay：源临时名消失；正式目标要么接管 created，要么恢复为远端文件
+        if let Some(ov) = self.overlays.get(&parent) {
+            let mut ov = ov.write();
+            ov.created.remove(name_s);
+            ov.scratch.remove(name_s);
+            ov.deleted.remove(new_s);
+            if dst_scratch {
+                ov.created.insert(new_s.to_string(), ino);
+                ov.scratch.insert(new_s.to_string());
+            } else if target_remote {
+                ov.created.remove(new_s);
+            } else {
+                ov.created.insert(new_s.to_string(), ino);
+            }
+        }
+
+        self.mark_meta_dirty();
+        self.invalidate_parent_listing(parent);
+        // 不在这里发内核失效通知：rename 仍在请求处理路径上，inval_entry 与
+        // 待回复的 rename 可能互相等待。内核会随 rename 更新 dentry，状态角标
+        // 由 1s 快照刷新。
+        self.add_log(logs::ACTION_RENAME, new_rel, false).await;
+        Ok(())
+    }
+}
+
+/// WPS 等编辑器的 `文件名.~#1`、`.~#2` 备份/临时文件。
+fn is_numbered_backup_name(name: &str) -> bool {
+    match name.rsplit_once(".~#") {
+        Some((_, digits)) => !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
+/// 编辑器临时/备份文件名：按需挂载把它们当作 scratch，不参与上传。
+/// 注意：这不等于“可以自动删除”——其中 `file.~#N` 可能保存着用户内容。
+fn is_scratch_name(name: &str) -> bool {
+    name.starts_with(".goutputstream-")
+        || name.starts_with(".~lock.")
+        || name.starts_with(".~")
+        || name.starts_with("~$")
+        || (name.starts_with('#') && name.ends_with('#'))
+        || name.ends_with(".swp")
+        || is_numbered_backup_name(name)
+}
+
+/// 可以安全自动清理的临时文件名：只包含确定不承载用户内容的短命产物。
+/// 排除 `.~*`（锁/备份）、`*.swp`、`file.~#N`（WPS 备份）等。
+fn is_cleanup_scratch_name(name: &str) -> bool {
+    name.starts_with(".goutputstream-")
+        || name.starts_with("~$")
+        || (name.starts_with('#') && name.ends_with('#'))
+}
+
+/// 递归收集缓存目录里可安全清理的编辑器临时文件，跳过下载暂存目录和回收站。
+fn collect_scratch_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if path.is_dir() {
+            if name == ".tmp" || name == ".Trash" || name.starts_with(".Trash-") {
+                continue;
+            }
+            collect_scratch_files(root, &path, out);
+        } else if is_cleanup_scratch_name(&name) {
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.push((rel.to_string_lossy().replace('\\', "/"), path));
+            }
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -2974,6 +3296,18 @@ pub(crate) fn mount_options() -> Vec<MountOption> {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
+
+    #[test]
+    fn transfer_speed_and_eta_are_reported() {
+        let mut t = Transfer::new("download", 1000);
+        assert_eq!(t.speed_and_eta(), (0, None));
+        t.done.store(500, Ordering::Relaxed);
+        t.started = Instant::now() - Duration::from_secs(2);
+        let (speed, eta) = t.speed_and_eta();
+        assert!((240..=260).contains(&speed), "speed={speed}");
+        assert!(matches!(eta, Some(1..=3)), "eta={eta:?}");
+    }
+
     #[test]
     fn transfer_saturation_does_not_block_metadata_and_queue_is_bounded() {
         let transfers = OpPool::new(1);
@@ -3001,5 +3335,213 @@ mod scheduler_tests {
         ));
         result.recv_timeout(Duration::from_secs(1)).unwrap();
         release.send(()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod hydration_read_tests {
+    use super::*;
+    use crate::{
+        connect::nas_client::RemoteEntry,
+        service::database,
+        tasks::{
+            file_filter::FileFilter,
+            ondemand::{remote::RemoteOps, OnDemandConfig},
+        },
+    };
+    use futures_util::future::BoxFuture;
+    use tokio::sync::Notify;
+
+    const LARGE: u64 = 4 * 1024 * 1024 * 1024;
+
+    /// `hydrate` 进入 `download_to` 后阻塞并持有按文件缓存锁，直到测试放行。
+    struct BlockingNas {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        range_reads: AtomicU64,
+    }
+
+    impl RemoteOps for BlockingNas {
+        fn ls<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Vec<RemoteEntry>>> {
+            Box::pin(async {
+                Ok(vec![RemoteEntry {
+                    name: "large.iso".into(),
+                    size: LARGE,
+                    mtim: 1,
+                    ..Default::default()
+                }])
+            })
+        }
+        fn mkdir<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { anyhow::bail!("unexpected mutation") })
+        }
+        fn remove<'a>(&'a self, _: &'a [String]) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { anyhow::bail!("unexpected mutation") })
+        }
+        fn rename<'a>(&'a self, _: &'a str, _: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { anyhow::bail!("unexpected mutation") })
+        }
+        fn download<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
+            Box::pin(async { anyhow::bail!("full download forbidden in range test") })
+        }
+        fn download_to<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a std::path::Path,
+            _: Arc<dyn Fn(u64) + Send + Sync>,
+        ) -> BoxFuture<'a, Result<u64>> {
+            Box::pin(async move {
+                self.started.notify_one();
+                self.release.notified().await;
+                anyhow::bail!("test abort")
+            })
+        }
+        fn upload<'a>(
+            &'a self,
+            _: &'a str,
+            _: Vec<u8>,
+            _: Option<i64>,
+        ) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { anyhow::bail!("unexpected mutation") })
+        }
+        fn read_range<'a>(
+            &'a self,
+            _: &'a str,
+            offset: u64,
+            size: usize,
+        ) -> BoxFuture<'a, Result<Vec<u8>>> {
+            self.range_reads.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                Ok((offset..offset + size as u64)
+                    .map(|n| (n % 251) as u8)
+                    .collect())
+            })
+        }
+    }
+
+    async fn fixture() -> (tempfile::TempDir, Arc<Shared>, Arc<BlockingNas>, u64) {
+        let tmp = tempfile::tempdir().unwrap();
+        let nas = Arc::new(BlockingNas {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            range_reads: AtomicU64::new(0),
+        });
+        let db = database::open_db(&tmp.path().join("db.sqlite"))
+            .await
+            .unwrap();
+        database::migrate(&db).await.unwrap();
+        let shared = Shared::new(
+            OnDemandConfig {
+                task_id: 1,
+                task_name: "hydration-read".into(),
+                mountpoint: tmp.path().join("mount"),
+                nas_root: "root".into(),
+                cache_root: tmp.path().join("cache"),
+                cache_limit_bytes: 1024 * 1024 * 1024,
+            },
+            nas.clone(),
+            tokio::runtime::Handle::current(),
+            db,
+            FileFilter::from_db(None),
+        )
+        .unwrap();
+        let ino = shared
+            .resolve_child(ROOT_INO, std::ffi::OsStr::new("large.iso"))
+            .await
+            .unwrap()
+            .unwrap();
+        (tmp, Arc::new(shared), nas, ino)
+    }
+
+    /// 回归：显式“下载到本地”进行期间，读取同一大文件必须返回远端数据而不是 EAGAIN。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_while_hydrating_returns_remote_bytes() {
+        let (_tmp, shared, nas, ino) = fixture().await;
+        let s = shared.clone();
+        let hydrate = tokio::spawn(async move {
+            let _ = shared.hydrate(ino).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), nas.started.notified())
+            .await
+            .expect("hydrate should reach download_to");
+        let data = tokio::time::timeout(Duration::from_secs(2), s.read_placeholder(ino, 0, 4096))
+            .await
+            .expect("read must not block behind hydrate")
+            .expect("read must not fail with EAGAIN");
+        assert_eq!(data.len(), 4096);
+        assert_eq!(data[0], 0);
+        assert!(nas.range_reads.load(Ordering::Relaxed) >= 1);
+        nas.release.notify_one();
+        let _ = hydrate.await;
+    }
+
+    /// 回归：干净文件 close/flush 触发的上传不应等待 hydrate 持有的缓存锁。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_upload_does_not_wait_for_hydration_lock() {
+        let (_tmp, shared, _nas, ino) = fixture().await;
+        shared.cache.set_state(
+            "large.iso",
+            CacheState {
+                size: LARGE,
+                dirty: false,
+                uploading: false,
+                stamp: (LARGE, 1),
+                mtime: 1,
+                last_access_ms: 1,
+            },
+        );
+        let guard = shared.cache.lock_for("large.iso").lock_owned().await;
+        let result = tokio::time::timeout(Duration::from_secs(1), shared.upload_ino(ino)).await;
+        drop(guard);
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "clean upload must return without waiting for the lock"
+        );
+    }
+}
+
+#[cfg(test)]
+mod scratch_pattern_tests {
+    use super::{is_cleanup_scratch_name, is_scratch_name};
+
+    #[test]
+    fn detects_editor_temp_names() {
+        for name in [
+            ".goutputstream-ABC123",
+            ".~lock.report.docx#",
+            ".~report.docx",
+            "~$report.docx",
+            "#autosave#",
+            "swap.swp",
+            "cc-t.txt.~#1",
+            "report.~#12",
+        ] {
+            assert!(is_scratch_name(name), "{name} should be scratch");
+        }
+    }
+
+    #[test]
+    fn numbered_backups_are_not_auto_cleaned() {
+        // file.~#N / .~* / .swp 可能承载用户内容，只能识别为临时文件，
+        // 不能自动删除。
+        assert!(!is_cleanup_scratch_name("cc-t.txt.~#1"));
+        assert!(!is_cleanup_scratch_name(".~lock.report.docx#"));
+        assert!(!is_cleanup_scratch_name("swap.swp"));
+        assert!(is_cleanup_scratch_name(".goutputstream-ABC"));
+        assert!(is_cleanup_scratch_name("~$report.docx"));
+        assert!(is_cleanup_scratch_name("#autosave#"));
+    }
+
+    #[test]
+    fn does_not_treat_normal_files_as_scratch() {
+        for name in [
+            "report.docx",
+            ".gitignore",
+            "notes.txt",
+            "archive.tar.gz",
+            "file.~#",
+        ] {
+            assert!(!is_scratch_name(name), "{name} must not be scratch");
+        }
     }
 }

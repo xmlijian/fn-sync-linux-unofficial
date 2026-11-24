@@ -5,7 +5,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 sys.path.insert(0, "/usr/lib/fn-sync-client")
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from fnsync_ipc import locate, request
@@ -19,6 +21,479 @@ def notify(title, body):
         pass
 
 
+def notifications_enabled():
+    """GNOME 关闭横幅（勿扰）时 notify-send 实际不可见，需要别的进度入口。"""
+    try:
+        out = subprocess.run(
+            ["gsettings", "get", "org.gnome.desktop.notifications", "show-banners"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip().lower()
+        return out != "false"
+    except (OSError, subprocess.SubprocessError):
+        return True
+
+
+def _gui_env():
+    return os.environ.get("FNSYNC_GUI") == "1" and bool(
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    )
+
+
+def _human_bytes(n):
+    n = float(n or 0)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{int(n)} B" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TiB"
+
+
+def _human_duration(seconds):
+    seconds = int(seconds or 0)
+    if seconds >= 3600:
+        return f"{seconds // 3600}小时{(seconds % 3600) // 60}分"
+    if seconds >= 60:
+        return f"{seconds // 60}分{seconds % 60}秒"
+    return f"{seconds}秒"
+
+
+def _format_transfer(state):
+    """37% · 1.2 GiB/4.15 GiB · 45.3 MiB/s · 剩余1分12秒"""
+    parts = [f'{state.get("progress", 0)}%']
+    total = state.get("total") or 0
+    if total:
+        parts.append(f'{_human_bytes(state.get("done", 0))}/{_human_bytes(total)}')
+    speed = state.get("speed") or 0
+    if speed:
+        parts.append(f"{_human_bytes(speed)}/s")
+    eta = state.get("eta")
+    if eta is not None:
+        parts.append(f"剩余{_human_duration(eta)}")
+    return " · ".join(parts)
+
+
+class ProgressDialog:
+    """GUI 进度窗。
+
+    GTK3 可用时显示实时百分比 + 大小 + 速度 + 剩余时间；GTK 不可用时退回
+    zenity（只有百分比）。只在右键菜单入口（FNSYNC_GUI=1）且桌面通知不可见时启用。
+    """
+
+    def __init__(self, title, initial_text):
+        self._thread = None
+        self._gtk = None
+        self._glib = None
+        self._window = None
+        self._label = None
+        self._bar = None
+        self._zenity = None
+        self._closed = False
+        self._ready = threading.Event()
+        # 只要从文件管理器触发就显示进度窗：下载/释放必须始终有可见反馈，
+        # 不能依赖系统通知是否被关闭。
+        if not _gui_env():
+            return
+        self._thread = threading.Thread(
+            target=self._run_gtk, args=(title, initial_text), daemon=True
+        )
+        self._thread.start()
+        self._ready.wait(timeout=2)
+        if self._gtk is None:
+            self._start_zenity(title, initial_text)
+
+    def _run_gtk(self, title, text):
+        try:
+            import gi
+            gi.require_version("Gtk", "3.0")
+            from gi.repository import Gtk, GLib
+        except Exception:
+            self._ready.set()
+            return
+        self._gtk, self._glib = Gtk, GLib
+        try:
+            win = Gtk.Window(title=title)
+            win.set_default_size(500, 130)
+            win.set_resizable(False)
+            win.set_keep_above(True)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            for side in ("top", "bottom", "start", "end"):
+                getattr(box, f"set_margin_{side}")(14)
+            label = Gtk.Label(label=text)
+            label.set_xalign(0)
+            label.set_line_wrap(True)
+            bar = Gtk.ProgressBar()
+            box.pack_start(label, False, False, 0)
+            box.pack_start(bar, False, False, 0)
+            win.add(box)
+            win.connect("destroy", Gtk.main_quit)
+            self._window, self._label, self._bar = win, label, bar
+            win.show_all()
+        except Exception:
+            self._gtk = None
+            self._ready.set()
+            return
+        self._ready.set()
+        Gtk.main()
+
+    def _start_zenity(self, title, text):
+        try:
+            self._zenity = subprocess.Popen(
+                ["zenity", "--progress", f"--title={title}", f"--text={text}",
+                 "--auto-close", "--no-cancel", "--percentage=0", "--time-remaining"],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True,
+            )
+        except OSError:
+            self._zenity = None
+
+    def update(self, percent, text):
+        percent = max(0.0, min(100.0, float(percent or 0)))
+        if self._gtk is not None and self._glib is not None:
+            try:
+                self._glib.idle_add(self._apply, percent, text)
+            except Exception:
+                pass
+        proc = self._zenity
+        if proc and proc.poll() is None:
+            try:
+                proc.stdin.write(f"{int(percent)}\n".encode())
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                self._zenity = None
+
+    def _apply(self, percent, text):
+        try:
+            if self._bar is not None:
+                self._bar.set_fraction(percent / 100.0)
+            if self._label is not None:
+                self._label.set_text(text)
+        except Exception:
+            pass
+        return False
+
+    def _quit_gtk(self):
+        try:
+            if self._window is not None:
+                self._window.destroy()
+            self._gtk.main_quit()
+        except Exception:
+            pass
+        return False
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self._gtk is not None and self._glib is not None:
+            try:
+                self._glib.idle_add(self._quit_gtk)
+            except Exception:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
+        proc = self._zenity
+        if proc and proc.poll() is None:
+            try:
+                proc.stdin.write(b"100\n")
+                proc.stdin.close()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                proc.terminate()
+        self._zenity = None
+
+
+def finish_info(message):
+    """完成提示：通知可用就走通知；否则 GUI 入口弹 3 秒自动关闭的提示窗。"""
+    if notifications_enabled():
+        notify("操作完成", message)
+        return
+    if _gui_env():
+        try:
+            subprocess.run(
+                ["zenity", "--info", "--title=飞牛同步", "--timeout=3", f"--text={message}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6,
+            )
+            return
+        except (OSError, subprocess.SubprocessError):
+            pass
+    notify("操作完成", message)
+
+
+def report_errors(errors):
+    if not errors:
+        return
+    for line in errors:
+        print(f"操作失败：{line}", file=sys.stderr)
+    message = "\n".join(errors[:10])
+    if len(errors) > 10:
+        message += f"\n… 另有 {len(errors) - 10} 项"
+    notify("操作失败", message)
+    if notifications_enabled() or not _gui_env():
+        return
+    try:
+        subprocess.run(
+            ["zenity", "--error", "--title=飞牛同步", f"--text={message}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def request_retry(sock, action, path="", timeout=30, retries=50):
+    for _ in range(retries):
+        try:
+            return request(sock, action, path, timeout=timeout)
+        except RuntimeError as error:
+            if "控制操作繁忙" in str(error) or "传输队列已满" in str(error):
+                time.sleep(0.1)
+                continue
+            raise
+    raise RuntimeError("控制操作繁忙或传输队列已满，请稍后重试")
+
+
+def fetch_states(sock):
+    return {f["path"]: f for f in request(sock, "status")["files"]}
+
+
+DOWNLOAD_LABEL = {"download": "下载到本地", "pin": "保留并下载"}
+
+
+def download_files(sock, action, files):
+    """先过滤已完成的文件，再全部入队并统一轮询。
+
+    守护进程最多 4 个并发下载，其余显示等待；目录展开后已缓存的
+    文件在这里跳过，避免无意义的排队。
+    """
+    label = DOWNLOAD_LABEL[action]
+    states = fetch_states(sock)
+    selected = []
+    skipped = 0
+    for name in files:
+        st = states.get(name) or {}
+        state = st.get("state")
+        if action == "download" and state in ("cached", "dirty"):
+            skipped += 1
+            continue
+        if action == "pin" and state == "cached" and st.get("pinned"):
+            skipped += 1
+            continue
+        selected.append(name)
+    files = selected
+    if not files:
+        return [], skipped
+
+    total_files = max(1, len(files))
+    dialog = ProgressDialog("飞牛同步", f"准备{label} {len(files)} 个文件…")
+    errors = []
+    try:
+        pending = deque(files)
+        active = set()
+        done = 0
+        totals = {name: 0 for name in files}
+        dones = {name: 0 for name in files}
+        last_seen = {}
+        last_print_at = {}
+
+        def submit_next():
+            # 守护进程的 download_slots=4；只提交 4 个在途任务，
+            # 既用满并发又给释放/写入回传留出传输池线程。
+            while pending and len(active) < 4:
+                name = pending.popleft()
+                try:
+                    request_retry(sock, action, name, timeout=30)
+                except (OSError, RuntimeError) as error:
+                    errors.append(f"{name}: {error}")
+                    done += 1
+                    continue
+                active.add(name)
+
+        submit_next()
+        while active or pending:
+            states = fetch_states(sock)
+            agg_speed = 0
+            current = None
+            for name in files:
+                st = states.get(name) or {}
+                totals[name] = st.get("total") or st.get("size") or totals[name]
+            for name in list(active):
+                st = states.get(name)
+                if not st:
+                    errors.append(f"{name}: 文件状态已失效，请重试")
+                    active.discard(name)
+                    done += 1
+                    continue
+                if st.get("error"):
+                    errors.append(f"{name}: {st['error']}")
+                    active.discard(name)
+                    done += 1
+                    continue
+                if st.get("state") in ("cached", "dirty"):
+                    dones[name] = totals[name] or st.get("total") or 0
+                    active.discard(name)
+                    done += 1
+                    print(f"{label}：{name}", flush=True)
+                    continue
+                dones[name] = max(dones.get(name, 0), st.get("done") or 0)
+                current = name
+                if st.get("state") == "download":
+                    agg_speed += st.get("speed") or 0
+                prev = last_seen.get(name)
+                if st.get("state") == "queued" and prev != "queued":
+                    print(f"[等待下载] {name}", flush=True)
+                    last_seen[name] = "queued"
+                elif st.get("state") == "download" and st.get("progress") != prev:
+                    now = time.time()
+                    if now - last_print_at.get(name, 0) >= 1.0:
+                        print(f"[{_format_transfer(st)}] {name}", flush=True)
+                        last_print_at[name] = now
+                        last_seen[name] = st.get("progress")
+            total_bytes = sum(totals.values())
+            done_bytes = sum(dones.values())
+            if total_bytes:
+                percent = min(100, done_bytes * 100 // total_bytes)
+            else:
+                percent = done * 100 // total_files
+            remaining = max(0, total_bytes - done_bytes)
+            eta = remaining // agg_speed if agg_speed else None
+            text = f"{label} {done}/{len(files)} · {percent}%\n"
+            if total_bytes:
+                text += f"{_human_bytes(done_bytes)} / {_human_bytes(total_bytes)}"
+                if agg_speed:
+                    text += f" · {_human_bytes(agg_speed)}/s"
+                if eta is not None:
+                    text += f" · 剩余{_human_duration(eta)}"
+                text += "\n"
+            if current:
+                text += os.path.basename(current)
+                if len(active) > 1:
+                    text += f"（同时 {len(active)} 个）"
+            dialog.update(percent, text)
+            submit_next()
+            time.sleep(0.5)
+        if not errors:
+            dialog.update(100, f"{label}完成：{len(files)} 个文件")
+    finally:
+        dialog.close()
+    return errors, skipped
+
+
+SKIP_LABELS = {
+    "pinned": "已保留",
+    "dirty": "本地修改",
+    "placeholder": "未下载",
+    "active": "传输中",
+    "unknown": "状态未知",
+}
+
+
+def _skip_summary(skipped):
+    return "、".join(
+        f"{label} {skipped[key]}"
+        for key, label in SKIP_LABELS.items()
+        if skipped.get(key)
+    )
+
+
+def free_files(sock, files, bulk=False):
+    """释放本地副本；只处理已下载、未保留、未被占用的文件。
+
+    bulk=True（文件夹级操作）跳过不可释放的文件并汇总；bulk=False（显式
+    选中文件）把不可释放原因作为错误返回，保持 CLI 的明确反馈。
+    释放本身瞬时完成，不弹进度/成功窗；文件夹级操作由调用方发完成汇总。
+    """
+    errors = []
+    skipped = {key: 0 for key in SKIP_LABELS}
+    states = fetch_states(sock)
+    pending = deque()
+    for name in files:
+        st = states.get(name)
+        if not st:
+            skipped["unknown"] += 1
+            if not bulk:
+                errors.append(f"{name}: 文件状态已失效，请重试")
+            continue
+        state = st.get("state")
+        if st.get("pinned"):
+            skipped["pinned"] += 1
+            if not bulk:
+                errors.append(f"{name}: 已设为“始终保留在此电脑”，请先取消保留")
+        elif state == "dirty":
+            skipped["dirty"] += 1
+            if not bulk:
+                errors.append(f"{name}: 文件有未上传的本地修改，不能释放")
+        elif state == "placeholder":
+            skipped["placeholder"] += 1
+        elif state in ("cached", "releasing"):
+            pending.append(name)
+        else:
+            skipped["active"] += 1
+            if not bulk:
+                errors.append(f"{name}: 文件正在传输，稍后再试")
+    if not pending:
+        return errors, 0, skipped
+
+    released = 0
+    active = set()
+    deadline = time.time() + min(600.0, max(60.0, len(pending) * 2.0))
+
+    def submit_next():
+        # 传输池队列容量 128；这里分批提交，避免一次压满队列。
+        while pending and len(active) < 64:
+            name = pending.popleft()
+            try:
+                request_retry(sock, "free", name, timeout=30, retries=200)
+            except (OSError, RuntimeError) as error:
+                errors.append(f"{name}: {error}")
+                continue
+            active.add(name)
+
+    submit_next()
+    while active or pending:
+        if time.time() >= deadline:
+            for name in list(active) + list(pending):
+                errors.append(f"{name}: 释放超时")
+            active.clear()
+            pending.clear()
+            break
+        states = fetch_states(sock)
+        for name in list(active):
+            st = states.get(name)
+            if not st:
+                errors.append(f"{name}: 文件状态已失效，请重试")
+                active.discard(name)
+                continue
+            if st.get("error"):
+                errors.append(f"{name}: {st['error']}")
+                active.discard(name)
+                continue
+            if st.get("state") == "placeholder":
+                released += 1
+                active.discard(name)
+                print(f"释放空间：{name}", flush=True)
+        submit_next()
+        time.sleep(0.1)
+    return errors, released, skipped
+
+
+def unpin_files(sock, files):
+    errors = []
+    states = fetch_states(sock)
+    targets = [name for name in files if (states.get(name) or {}).get("pinned")]
+    skipped = len(files) - len(targets)
+    for name in targets:
+        try:
+            request_retry(sock, "unpin", name, timeout=30)
+        except (OSError, RuntimeError) as error:
+            errors.append(f"{name}: {error}")
+        else:
+            print(f"取消始终保留：{name}", flush=True)
+    return errors, len(targets), skipped
+
+
 ACTION_LABEL = {"download": "下载到本地", "free": "释放空间", "pin": "始终保留在此电脑", "unpin": "取消始终保留", "status": "查看状态"}
 
 
@@ -28,37 +503,67 @@ def main():
     parser.add_argument("paths", nargs="*", default=["."])
     args = parser.parse_args()
     failed = 0
+    errors = []
+    # 右键多选会以多个参数传入；按挂载点聚合成一批，下载才能并行。
+    # bulk 表示这一批里是否选中了文件夹，用于决定批量操作的汇总提示。
+    groups = {}
     for path in args.paths or ["."]:
         try:
             sock, rel, status = locate(path)
             if args.action == "status":
                 print(json.dumps(status, ensure_ascii=False, indent=2))
                 continue
-            files = request(sock, "list", rel, timeout=60)["files"]
-            notify("正在处理", f"{len(files)} 个文件")
-            for name in files:
-                request(sock, args.action, name, timeout=30)
-                if args.action in ("download", "pin"):
-                    last = None
-                    while True:
-                        states = request(sock, "status")["files"]
-                        state = next((x for x in states if x["path"] == name), None)
-                        if not state:
-                            raise RuntimeError("文件状态已失效，请重试")
-                        if state.get("error"):
-                            raise RuntimeError(state["error"])
-                        if state["state"] in ("cached", "dirty"):
-                            break
-                        if state["progress"] != last:
-                            last = state["progress"]
-                            notify(f"下载中 {last}%", f'{name}\n{state["done"]} / {state["total"]} 字节')
-                        time.sleep(0.5)
-                print(f"{ACTION_LABEL[args.action]}：{name}")
-            notify("操作完成", f"{ACTION_LABEL[args.action]}：{len(files)} 个文件")
+            is_dir = rel == "" or any(
+                f["path"] == rel and f["state"] == "directory"
+                for f in status["files"]
+            )
+            group = groups.setdefault(sock, {"files": [], "bulk": False})
+            group["files"].extend(request(sock, "list", rel, timeout=60)["files"])
+            group["bulk"] = group["bulk"] or is_dir
         except (OSError, ValueError, RuntimeError) as error:
             failed += 1
-            print(f"{path}: {error}", file=sys.stderr)
-            notify("操作失败", str(error))
+            errors.append(f"{path}: {error}")
+    for sock, group in groups.items():
+        files = list(dict.fromkeys(group["files"]))
+        bulk = group["bulk"]
+        if not files:
+            print("没有可处理的文件")
+            continue
+        try:
+            if args.action in ("download", "pin"):
+                errs, skipped = download_files(sock, args.action, files)
+                errors.extend(errs)
+                failed += bool(errs)
+                if not errs:
+                    msg = f'{ACTION_LABEL[args.action]}：{len(files) - skipped} 个文件'
+                    if skipped:
+                        reason = "已下载或已修改" if args.action == "download" else "已保留并下载"
+                        msg += f"，跳过 {skipped} 个{reason}文件"
+                    finish_info(msg)
+            elif args.action == "free":
+                errs, released, skipped = free_files(sock, files, bulk)
+                errors.extend(errs)
+                failed += bool(errs)
+                # 单文件释放保持“成功不弹提示”；文件夹级操作给一份汇总。
+                if not errs and bulk:
+                    msg = f"释放空间：已释放 {released} 个文件"
+                    detail = _skip_summary(skipped)
+                    if detail:
+                        msg += f"；跳过 {detail}"
+                    finish_info(msg)
+            elif args.action == "unpin":
+                errs, count, skipped = unpin_files(sock, files)
+                errors.extend(errs)
+                failed += bool(errs)
+                if not errs:
+                    msg = f"取消始终保留：{count} 个文件"
+                    if skipped:
+                        msg += f"（{skipped} 个本来未保留）"
+                    finish_info(msg)
+        except (OSError, ValueError, RuntimeError) as error:
+            failed += 1
+            errors.append(f"{sock}: {error}")
+    report_errors(errors)
     return bool(failed)
 
 if __name__ == "__main__":

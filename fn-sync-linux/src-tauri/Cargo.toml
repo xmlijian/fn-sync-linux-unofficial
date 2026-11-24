@@ -91,10 +91,16 @@ extended-description = """\
 assets = [
     ["../scripts/desktop/fnsync-ctl", "usr/bin/fnsync-ctl", "755"],
     ["../scripts/desktop/fnsync_ipc.py", "usr/lib/fn-sync-client/", "644"],
+    ["../scripts/desktop/fnsync_menu.py", "usr/lib/fn-sync-client/", "644"],
     ["../scripts/desktop/fnsync_status.py", "usr/share/nautilus-python/extensions/", "644"],
     ["target/release/fn-sync-client", "usr/bin/fn-sync-client", "755"],
     ["debian/fn-sync-client.desktop", "usr/share/applications/", "644"],
     ["icons/128x128.png", "usr/share/icons/hicolor/128x128/apps/fn-sync-client.png", "644"],
     ["icons/512x512.png", "usr/share/icons/hicolor/512x512/apps/fn-sync-client.png", "644"],
+    ["../icons/emblems/emblem-fnsync-online.svg", "usr/share/icons/hicolor/scalable/emblems/", "644"],
+    ["../icons/emblems/emblem-fnsync-local.svg", "usr/share/icons/hicolor/scalable/emblems/", "644"],
+    ["../icons/emblems/emblem-fnsync-downloading.svg", "usr/share/icons/hicolor/scalable/emblems/", "644"],
+    ["../icons/emblems/emblem-fnsync-uploading.svg", "usr/share/icons/hicolor/scalable/emblems/", "644"],
+    ["../icons/emblems/emblem-fnsync-modified.svg", "usr/share/icons/hicolor/scalable/emblems/", "644"],
 ]
 
