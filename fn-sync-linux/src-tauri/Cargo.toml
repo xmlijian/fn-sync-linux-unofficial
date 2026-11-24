@@ -89,6 +89,9 @@ extended-description = """\
 支持按需同步（open_cloud）：FUSE3 挂载，文件仅占位元数据，打开时才下载，缓存 LRU 淘汰释放磁盘。
 """
 assets = [
+    ["../scripts/desktop/fnsync-ctl", "usr/bin/fnsync-ctl", "755"],
+    ["../scripts/desktop/fnsync_ipc.py", "usr/lib/fn-sync-client/", "644"],
+    ["../scripts/desktop/fnsync_status.py", "usr/share/nautilus-python/extensions/", "644"],
     ["target/release/fn-sync-client", "usr/bin/fn-sync-client", "755"],
     ["debian/fn-sync-client.desktop", "usr/share/applications/", "644"],
     ["icons/128x128.png", "usr/share/icons/hicolor/128x128/apps/fn-sync-client.png", "644"],

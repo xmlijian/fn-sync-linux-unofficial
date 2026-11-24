@@ -110,7 +110,7 @@ struct DirList {
 /// 用固定线程数而不是每个请求一个线程：`find` 之类的递归遍历会瞬间产生
 /// 成千上万个 lookup，每请求一线程会直接把进程压垮。
 pub struct OpPool {
-    tx: std::sync::mpsc::Sender<Box<dyn FnOnce() + Send + 'static>>,
+    tx: std::sync::mpsc::SyncSender<Box<dyn FnOnce() + Send + 'static>>,
     /// 在途操作：id → (标签, 开始时刻)。用于诊断“哪个回调卡住了”。
     inflight: Arc<DashMap<u64, (&'static str, Instant)>>,
     seq: Arc<AtomicU64>,
@@ -120,7 +120,7 @@ pub struct OpPool {
 
 impl OpPool {
     fn new(threads: usize) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send + 'static>>();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Box<dyn FnOnce() + Send + 'static>>(128);
         let rx = Arc::new(Mutex::new(rx));
         let inflight: Arc<DashMap<u64, (&'static str, Instant)>> = Arc::new(DashMap::new());
         let queued = Arc::new(AtomicU64::new(0));
@@ -153,7 +153,7 @@ impl OpPool {
     }
 
     /// 提交任务；池已关闭时返回 false。
-    fn submit(&self, label: &'static str, job: Box<dyn FnOnce() + Send + 'static>) -> bool {
+    pub fn submit(&self, label: &'static str, job: Box<dyn FnOnce() + Send + 'static>) -> bool {
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
         self.inflight.insert(id, (label, Instant::now()));
         self.queued.fetch_add(1, Ordering::Relaxed);
@@ -162,7 +162,7 @@ impl OpPool {
             job();
             inflight.remove(&id);
         });
-        match self.tx.send(wrapped) {
+        match self.tx.try_send(wrapped) {
             Ok(()) => true,
             Err(_) => {
                 self.inflight.remove(&id);
@@ -195,45 +195,6 @@ enum NotifyMsg {
     Entry { parent: u64, name: String },
     /// inode 属性/内容失效：文件状态变化（如下载完成）时用
     Inode { ino: u64 },
-    /// 目录列表整体失效
-    Dir { ino: u64 },
-    /// 自触发一次属性变更（保留 mtime）。
-    ///
-    /// FUSE 的 inval_* 不会产生 inotify 事件，因此文件管理器（Nautilus/GIO）
-    /// 收不到通知、不会刷新视图。而在挂载点内对文件执行一次 utimensat，
-    /// 内核就会向所有 watcher 发送 IN_ATTRIB —— 这正是让状态列自动更新的关键。
-    Touch { path: std::path::PathBuf },
-}
-
-/// 当前时刻（Unix 毫秒），用于节流。
-fn epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// 触发一次属性变更（保留 mtime），让内核向 inotify watcher 发 IN_ATTRIB。
-fn touch_preserve_mtime(path: &std::path::Path) {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let Ok(meta) = std::fs::metadata(path) else {
-        return;
-    };
-    let Ok(mtime) = meta.modified() else { return };
-    let now = SystemTime::now();
-    let ts = |t: SystemTime| -> libc::timespec {
-        let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
-        libc::timespec {
-            tv_sec: d.as_secs() as libc::time_t,
-            tv_nsec: d.subsec_nanos() as _,
-        }
-    };
-    let times = [ts(now), ts(mtime)];
-    if let Ok(c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
-        unsafe {
-            libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0);
-        }
-    }
 }
 
 /// 正在进行的传输（对应官方 CfAPI 的 transfer key / macOS 的 NSProgress）。
@@ -263,7 +224,7 @@ impl Transfer {
     }
 
     /// 进度百分比（0-100）。总量未知时返回 0。
-    fn percent(&self) -> u64 {
+    pub fn percent(&self) -> u64 {
         if self.total == 0 {
             return 0;
         }
@@ -308,11 +269,19 @@ pub struct Shared {
     /// 内核失效通知的发送端。真正的 `Notifier::inval_*` 是同步写 /dev/fuse
     /// 的阻塞调用，绝不能在任何 runtime 线程上执行（否则会锁死整个 runtime，
     /// 表现就是挂载树卡死）。因此交给一个专用线程串行发送。
-    notify_tx: std::sync::mpsc::Sender<NotifyMsg>,
+    notify_tx: std::sync::mpsc::SyncSender<NotifyMsg>,
     /// 通知线程的接收端（仅用于启动线程时移交）
     notify_rx: Arc<Mutex<std::sync::mpsc::Receiver<NotifyMsg>>>,
     /// 阻塞型 FUSE 回调的执行池（见 OpPool 文档）
     pub ops: Arc<OpPool>,
+    pub transfer_ops: Arc<OpPool>,
+    pub errors: DashMap<String, String>,
+    pub queued_downloads: DashMap<String, ()>,
+    pub control_slots: tokio::sync::Semaphore,
+    read_slots: Arc<tokio::sync::Semaphore>,
+    download_slots: tokio::sync::Semaphore,
+    pin_lock: Mutex<()>,
+    open_gate: Mutex<()>,
     pub stopping: Arc<AtomicBool>,
     uid: u32,
     gid: u32,
@@ -330,7 +299,7 @@ impl Shared {
         cache.load_meta();
         cache.clean_tmp();
         // 失效通知通道：专用线程消费，避免阻塞 runtime
-        let (notify_tx, notify_rx) = std::sync::mpsc::channel::<NotifyMsg>();
+        let (notify_tx, notify_rx) = std::sync::mpsc::sync_channel::<NotifyMsg>(256);
         let notify_rx = Arc::new(Mutex::new(notify_rx));
         let shared = Self {
             notify_rx,
@@ -348,7 +317,15 @@ impl Shared {
             next_ino: AtomicU64::new(ROOT_INO + 1),
             notify_tx,
             // 并发下载/遍历会同时占用多个池线程；线程太少会让后续请求排队等待。
-            ops: Arc::new(OpPool::new(16)),
+            ops: Arc::new(OpPool::new(8)),
+            transfer_ops: Arc::new(OpPool::new(8)),
+            errors: DashMap::new(),
+            queued_downloads: DashMap::new(),
+            control_slots: tokio::sync::Semaphore::new(4),
+            read_slots: Arc::new(tokio::sync::Semaphore::new(128)),
+            download_slots: tokio::sync::Semaphore::new(4),
+            pin_lock: Mutex::new(()),
+            open_gate: Mutex::new(()),
             stopping: Arc::new(AtomicBool::new(false)),
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
@@ -515,12 +492,6 @@ impl Shared {
                         NotifyMsg::Inode { ino } => {
                             let _ = n.inval_inode(ino, 0, -1);
                         }
-                        NotifyMsg::Dir { ino } => {
-                            let _ = n.inval_inode(ino, 0, -1);
-                        }
-                        NotifyMsg::Touch { path } => {
-                            touch_preserve_mtime(&path);
-                        }
                     },
                     Err(_) => break,
                 }
@@ -529,7 +500,7 @@ impl Shared {
 
     /// 请求内核让某个目录项失效（异步、非阻塞）。
     fn notify_entry(&self, parent: u64, name: &str) {
-        let _ = self.notify_tx.send(NotifyMsg::Entry {
+        let _ = self.notify_tx.try_send(NotifyMsg::Entry {
             parent,
             name: name.to_string(),
         });
@@ -538,17 +509,8 @@ impl Shared {
     /// 请求内核刷新 inode 属性（状态列、大小等），并触发一次属性变更事件，
     /// 让文件管理器的状态列自动刷新。
     fn notify_inode(&self, ino: u64) {
-        let _ = self.notify_tx.send(NotifyMsg::Inode { ino });
-        let rel = self
-            .inodes
-            .get(&ino)
-            .map(|n| n.read().rel.clone())
-            .unwrap_or_default();
-        if !rel.is_empty() {
-            let _ = self.notify_tx.send(NotifyMsg::Touch {
-                path: self.cfg.mountpoint.join(&rel),
-            });
-        }
+        let _ = self.notify_tx.try_send(NotifyMsg::Inode { ino });
+        // UI consumes daemon status directly; never re-enter the FUSE mount to touch files.
     }
 
     /// 远端列出目录（带 TTL 缓存与离线回退）。
@@ -651,7 +613,7 @@ impl Shared {
     }
 
     /// 解析 (parent, name) → ino。overlay 优先，然后目录列表缓存（TTL 内不再远端取）。
-    async fn resolve_child(&self, parent: u64, name: &OsStr) -> Result<Option<u64>> {
+    pub async fn resolve_child(&self, parent: u64, name: &OsStr) -> Result<Option<u64>> {
         let name = name.to_string_lossy().to_string();
         if name.contains('/') || name.is_empty() || name == "." || name == ".." {
             return Ok(None);
@@ -666,7 +628,10 @@ impl Shared {
             }
         }
         let parent_rel = {
-            let ino = self.inodes.get(&parent).ok_or_else(|| anyhow!("no inode"))?;
+            let ino = self
+                .inodes
+                .get(&parent)
+                .ok_or_else(|| anyhow!("no inode"))?;
             let node = ino.read();
             node.rel.clone()
         };
@@ -693,7 +658,11 @@ impl Shared {
             {
                 let inode = self.inodes.get(&ino).ok_or_else(|| anyhow!("no inode"))?;
                 let mut node = inode.write();
-                node.size = if kind == FileType::Directory { DIR_SIZE } else { meta.len() };
+                node.size = if kind == FileType::Directory {
+                    DIR_SIZE
+                } else {
+                    meta.len()
+                };
                 node.mtime = meta
                     .modified()
                     .ok()
@@ -797,7 +766,11 @@ impl Shared {
         } else {
             node.size
         };
-        let default_perm = if kind == FileType::Directory { 0o755 } else { 0o644 };
+        let default_perm = if kind == FileType::Directory {
+            0o755
+        } else {
+            0o644
+        };
         // 允许 setattr(chmod) 覆盖；粘滞位（回收站 .Trash 需要 1777）必须保留。
         let perm = if node.mode != 0 {
             (node.mode & 0o7777) as u16
@@ -876,11 +849,13 @@ impl Shared {
     }
 
     fn inc_open(&self, ino: u64) {
+        let _gate = self.open_gate.lock();
         *self.open_count.entry(ino).or_insert(0) += 1;
     }
 
     /// 递减打开计数；归零时才真正关闭缓存文件句柄。
     fn dec_open(&self, ino: u64) {
+        let _gate = self.open_gate.lock();
         let remaining = {
             let mut count = self.open_count.entry(ino).or_insert(0);
             *count = count.saturating_sub(1);
@@ -895,7 +870,10 @@ impl Shared {
     fn is_in_use(&self, rel: &str) -> bool {
         self.ino_by_rel
             .get(rel)
-            .map(|ino| self.open_files.contains_key(&*ino))
+            .map(|ino| {
+                self.open_count.get(&*ino).map(|n| *n > 0).unwrap_or(false)
+                    || self.open_files.contains_key(&*ino)
+            })
             .unwrap_or(false)
     }
 
@@ -942,6 +920,7 @@ impl Shared {
 
     /// 设置/取消「始终保留在此电脑」，并持久化。
     pub fn set_pin(&self, rel: &str, pinned: bool) -> Result<()> {
+        let _pin_guard = self.pin_lock.lock();
         if pinned {
             self.pins.insert(rel.to_string(), ());
         } else {
@@ -956,6 +935,9 @@ impl Shared {
         let tmp = self.cache.root().join("pins.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec(&list)?)?;
         std::fs::rename(&tmp, self.pins_path())?;
+        if let Some(ino) = self.ino_by_rel.get(rel).map(|v| *v) {
+            self.notify_inode(ino);
+        }
         Ok(())
     }
 
@@ -964,6 +946,15 @@ impl Shared {
     /// 语义：删除缓存副本，文件回到占位状态；远端内容不受影响。
     /// 有未上传修改或已设为「始终保留」时拒绝，避免丢数据或违背用户意图。
     pub fn release(&self, rel: &str) -> Result<()> {
+        let lock = self.cache.lock_for(rel);
+        let _guard = lock
+            .try_lock()
+            .map_err(|_| anyhow!("文件正在传输或修改，稍后再试"))?;
+        let _pin_guard = self.pin_lock.lock();
+        let _open_guard = self.open_gate.lock();
+        if self.transfers.contains_key(rel) {
+            anyhow::bail!("文件正在传输，稍后再试");
+        }
         if self.is_dirty(rel) {
             anyhow::bail!("文件有未上传的本地修改，不能释放");
         }
@@ -985,7 +976,10 @@ impl Shared {
             self.cache.set_state(rel, st);
         }
         self.cache.remove(rel);
-        self.transfers.remove(rel);
+        self.errors.remove(rel);
+        if let Some(ino) = self.ino_by_rel.get(rel).map(|v| *v) {
+            self.notify_inode(ino);
+        }
         tracing::info!(rel, "on-demand content released (freed disk space)");
         Ok(())
     }
@@ -996,13 +990,16 @@ impl Shared {
 
     /// 文件当前的按需同步状态：`dirty`（本地有未上传修改）、
     /// `cached`（已下载）、`placeholder`（仅有占位，内容不占本地磁盘）。
-    fn file_state(&self, node: &Inode) -> &'static str {
+    pub fn file_state(&self, node: &Inode) -> &'static str {
         if node.kind == FileType::Directory {
             return "directory";
         }
         // 传输中优先展示：这是用户最需要看到的即时反馈
         if let Some(t) = self.transfers.get(&node.rel) {
             return t.kind; // "download" | "upload"
+        }
+        if self.queued_downloads.contains_key(&node.rel) {
+            return "queued";
         }
         if node.dirty {
             return "dirty";
@@ -1057,22 +1054,69 @@ impl Shared {
         }
     }
 
+    /// Serialize resize with hydration/upload; preserve old bytes for nonzero truncation.
+    pub async fn resize_content(&self, ino: u64, size: u64) -> Result<()> {
+        if size > 0 {
+            self.hydrate(ino).await?;
+        }
+        let rel = self
+            .inodes
+            .get(&ino)
+            .ok_or_else(|| anyhow!("no inode"))?
+            .read()
+            .rel
+            .clone();
+        let lock = self.cache.lock_for(&rel);
+        let _guard = tokio::time::timeout(Duration::from_secs(30), lock.lock())
+            .await
+            .map_err(|_| anyhow!("调整文件大小等待超时"))?;
+        if self.stopping.load(Ordering::Relaxed) {
+            anyhow::bail!("挂载正在停止");
+        }
+        let file = self.open_handle(ino)?;
+        file.lock().set_len(size)?;
+        let now = now_secs();
+        let stamp = self
+            .inodes
+            .get(&ino)
+            .ok_or_else(|| anyhow!("no inode"))?
+            .read()
+            .stamp;
+        self.cache.ensure_state(&rel, stamp, now);
+        self.cache.update(&rel, |s| {
+            s.size = size;
+            s.dirty = true;
+            s.mtime = now;
+        });
+        if let Some(inode) = self.inodes.get(&ino) {
+            let mut node = inode.write();
+            node.dirty = true;
+            node.size = size;
+            node.mtime = now;
+        }
+        self.mark_meta_dirty();
+        self.notify_inode(ino);
+        Ok(())
+    }
+
     /// 确保内容已缓存（等价官方 DemandWriter）：下载远端内容到缓存。
-    async fn hydrate(&self, ino: u64) -> Result<()> {
+    pub async fn hydrate(&self, ino: u64) -> Result<()> {
         let rel = {
             let inode = self.inodes.get(&ino).ok_or_else(|| anyhow!("no inode"))?;
             let node = inode.read();
             node.rel.clone()
         };
         let lock = self.cache.lock_for(&rel);
-        // hydrate 可能被多个 read/open 并发触发；有界等待，避免无限排队。
-        let _guard = match tokio::time::timeout(Duration::from_secs(30), lock.lock()).await {
-            Ok(g) => g,
-            Err(_) => {
-                tracing::warn!(rel = %rel, "hydrate lock wait timed out");
-                anyhow::bail!("hydrate lock timeout");
-            }
+        // Same-file readers await one hydration asynchronously; stop wakes all waiters.
+        let _guard = tokio::select! {
+            guard = lock.lock() => guard,
+            _ = self.wait_stopping() => anyhow::bail!("挂载正在停止"),
         };
+        if self.stopping.load(Ordering::Relaxed) {
+            anyhow::bail!("挂载正在停止");
+        }
+        self.queued_downloads.remove(&rel);
+        self.errors.remove(&rel);
         // 双检：可能已被并发下载或已变脏
         {
             let inode = self.inodes.get(&ino).ok_or_else(|| anyhow!("no inode"))?;
@@ -1089,6 +1133,12 @@ impl Shared {
                 return Ok(());
             }
         }
+        self.queued_downloads.insert(rel.clone(), ());
+        let _download_slot = tokio::select! {
+            permit = self.download_slots.acquire() => permit.map_err(|_| anyhow!("下载队列关闭"))?,
+            _ = self.wait_stopping() => anyhow::bail!("挂载正在停止"),
+        };
+        self.queued_downloads.remove(&rel);
         let stamp = {
             let inode = self.inodes.get(&ino).ok_or_else(|| anyhow!("no inode"))?;
             let node = inode.read();
@@ -1096,10 +1146,8 @@ impl Shared {
         };
         let remote = self.remote_path(&rel);
         // 标记“下载中”，让状态列/CLI 立即可见（官方是推 shell 进度条）
-        self.transfers.insert(
-            rel.clone(),
-            Transfer::new("download", stamp.0),
-        );
+        self.transfers
+            .insert(rel.clone(), Transfer::new("download", stamp.0));
         // 立刻通知一次：状态列要马上从“未下载”变成“下载中”
         self.notify_inode(ino);
         // 流式下载到暂存文件：边下边写，不把整个文件读进内存，
@@ -1114,31 +1162,18 @@ impl Shared {
             .get(&rel)
             .map(|t| t.done.clone())
             .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
-        // 进度通知节流：每 400ms 最多触发一次内核失效 + IN_ATTRIB，
-        // 让状态列实时滚动显示百分比，又不至于把 FUSE 打爆。
-        let prog_tx = self.notify_tx.clone();
-        let prog_mount = self.cfg.mountpoint.clone();
-        let prog_rel = rel.clone();
-        let last_notify = Arc::new(AtomicU64::new(0));
-        let progress: Arc<dyn Fn(u64) + Send + Sync> = Arc::new({
-            let counter = done_counter.clone();
-            move |done: u64| {
-                counter.store(done, Ordering::Relaxed);
-                let now = epoch_ms();
-                if now.saturating_sub(last_notify.load(Ordering::Relaxed)) >= 400 {
-                    last_notify.store(now, Ordering::Relaxed);
-                    // 只发 Touch（→ IN_ATTRIB）。inval_inode 是同步写 /dev/fuse，
-                    // 在传输期间会被内核排队，导致进度事件全部积压到结束才发出。
-                    let _ = prog_tx.send(NotifyMsg::Touch {
-                        path: prog_mount.join(&prog_rel),
-                    });
-                }
-            }
+        let progress: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |done| {
+            done_counter.store(done, Ordering::Relaxed);
         });
-        let downloaded = self.nas.download_to(&remote, &tmp, progress).await;
+        let downloaded = tokio::select! {
+            result = self.nas.download_to(&remote, &tmp, progress) => result,
+            _ = self.wait_stopping() => Err(anyhow!("挂载正在停止")),
+        };
         self.transfers.remove(&rel);
         let written = downloaded.map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
+            self.errors.insert(rel.clone(), e.to_string());
+            self.notify_inode(ino);
             tracing::warn!(rel = %rel, error = %e, "on-demand download failed");
             e
         })?;
@@ -1193,7 +1228,7 @@ impl Shared {
             Ok(g) => g,
             Err(_) => {
                 tracing::warn!(rel = %rel, "upload lock wait timed out");
-                return Ok(());
+                return Err(anyhow!("上传锁等待超时，文件仍有未上传修改"));
             }
         };
         let Some(state) = self.cache.state(&rel) else {
@@ -1206,15 +1241,18 @@ impl Shared {
         let total = std::fs::metadata(self.cache.file_path(&rel))
             .map(|m| m.len())
             .unwrap_or(0);
-        self.transfers.insert(
-            rel.clone(),
-            Transfer::new("upload", total),
-        );
+        self.transfers
+            .insert(rel.clone(), Transfer::new("upload", total));
 
         // 冲突检测基准 = 本地内容对应的远端戳（下载/上次上传时记录），
         // 而非 inode 上随时被轮询刷新的观察戳。
-        match self.do_upload(&rel, &state.stamp).await {
+        let upload = tokio::select! {
+            result = self.do_upload(&rel, &state.stamp) => result,
+            _ = self.wait_stopping() => Err(anyhow!("挂载正在停止")),
+        };
+        match upload {
             Ok(new_stamp) => {
+                self.errors.remove(&rel);
                 self.transfers.remove(&rel);
                 let size = self.cache.state(&rel).map(|s| s.size).unwrap_or(0);
                 self.cache.update(&rel, |s| {
@@ -1253,6 +1291,8 @@ impl Shared {
             Err(e) => {
                 self.transfers.remove(&rel);
                 self.cache.update(&rel, |s| s.uploading = false);
+                self.errors.insert(rel.clone(), e.to_string());
+                self.notify_inode(ino);
                 Err(e)
             }
         }
@@ -1272,7 +1312,7 @@ impl Shared {
         let parent_rel = Self::parent_rel(rel);
         let name = Self::file_name(rel);
         let parent_path = self.remote_path(parent_rel);
-        let entries = self.nas.ls(&parent_path).await.unwrap_or_default();
+        let entries = self.nas.ls(&parent_path).await?;
         if let Some(cur) = entries.iter().find(|e| e.name == name && !e.is_dir()) {
             let cur_stamp = (cur.size, cur.mtim);
             if cur_stamp != *stamp {
@@ -1282,8 +1322,8 @@ impl Shared {
                     chrono::Local::now().format("%Y-%m-%d %H-%M-%S")
                 );
                 let conflict_remote = format!("{parent_path}/{conflict_name}");
-                let cur_bytes = self.nas.download(&remote).await.unwrap_or_default();
-                if !cur_bytes.is_empty() {
+                let cur_bytes = self.nas.download(&remote).await?;
+                {
                     tracing::info!(
                         rel = %rel,
                         "remote changed during edit; keeping conflicted copy {conflict_name}"
@@ -1296,7 +1336,7 @@ impl Shared {
         }
         self.nas.upload(&remote, bytes.clone(), Some(mtime)).await?;
         // 用服务端真实回读戳覆盖，避免时间戳取整导致误判冲突
-        let entries = self.nas.ls(&parent_path).await.unwrap_or_default();
+        let entries = self.nas.ls(&parent_path).await?;
         let new_stamp = entries
             .iter()
             .find(|e| e.name == name && !e.is_dir())
@@ -1362,8 +1402,6 @@ impl Shared {
                     tracing::debug!(error = %e, "purge remote reserved skipped");
                 }
             }
-            self.load_pins();
-            self.process_notify_queue();
             self.flush_meta();
             self.flush_dirty_uploads();
             self.run_pending_removes().await;
@@ -1553,34 +1591,9 @@ impl Shared {
         Ok(())
     }
 
-    /// 处理来自外部工具（fnsync-ctl / 右键菜单）的刷新请求。
-    ///
-    /// CLI 直接改缓存文件或 pins.json，守护进程不会自动感知。
-    /// 因此 CLI 把相对路径追加到缓存根下的 `.notify`，worker 每 tick 读取一次，
-    /// 为这些文件补发内核失效 + IN_ATTRIB，文件管理器随之刷新。
-    fn process_notify_queue(&self) {
-        let path = self.cache.root().join(".notify");
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        if text.trim().is_empty() {
-            return;
-        }
-        // 先清空，避免处理过程中重复触发
-        let _ = std::fs::write(&path, "");
-        let mut seen: HashSet<String> = HashSet::new();
-        for rel in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            if !seen.insert(rel.to_string()) {
-                continue;
-            }
-            let Some(ino) = self.ino_by_rel.get(rel).map(|v| *v) else {
-                continue;
-            };
-            self.notify_inode(ino);
-            let parent_rel = Self::parent_rel(rel);
-            if let Some(parent) = self.ino_by_rel.get(parent_rel).map(|v| *v) {
-                self.notify_entry(parent, Self::file_name(rel));
-            }
+    async fn wait_stopping(&self) {
+        while !self.stopping.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -1589,15 +1602,9 @@ impl Shared {
             .cache
             .plan_eviction(&|rel| self.is_pinned(rel), &|rel| self.is_in_use(rel))
         {
-            tracing::info!(rel = %rel, "cache evicted (free disk space)");
-            let _ = std::fs::remove_file(self.cache.file_path(&rel));
-            // 淘汰后该文件回到占位状态，通知界面刷新
-            if let Some(ino) = self.ino_by_rel.get(&rel).map(|v| *v) {
-                self.notify_inode(ino);
-                let parent_rel = Self::parent_rel(&rel);
-                if let Some(parent) = self.ino_by_rel.get(parent_rel).map(|v| *v) {
-                    self.notify_entry(parent, Self::file_name(&rel));
-                }
+            // Selection is advisory; recheck under the same lock as downloads/uploads.
+            if let Err(error) = self.release(&rel) {
+                tracing::debug!(%rel, %error, "cache eviction deferred");
             }
         }
     }
@@ -1640,6 +1647,13 @@ async fn apply_write(shared: &Shared, ino: u64, off: u64, data: &[u8]) -> Result
         let node = inode.read();
         node.rel.clone()
     };
+    let lock = shared.cache.lock_for(&rel);
+    let _guard = tokio::time::timeout(Duration::from_secs(30), lock.lock())
+        .await
+        .map_err(|_| anyhow!("写入等待超时"))?;
+    if shared.stopping.load(Ordering::Relaxed) {
+        anyhow::bail!("挂载正在停止");
+    }
     let file = shared.open_handle(ino)?;
     {
         let f = file.lock();
@@ -1649,13 +1663,7 @@ async fn apply_write(shared: &Shared, ino: u64, off: u64, data: &[u8]) -> Result
         .cache
         .state(&rel)
         .map(|s| s.size)
-        .unwrap_or_else(|| {
-            shared
-                .inodes
-                .get(&ino)
-                .map(|n| n.read().size)
-                .unwrap_or(0)
-        });
+        .unwrap_or_else(|| shared.inodes.get(&ino).map(|n| n.read().size).unwrap_or(0));
     let new_size = std::cmp::max(off + data.len() as u64, existing);
     let now = now_secs();
     // 写未缓存的占位文件时先补状态记录（内容不对应任何远端版本 → stamp (0,0)）
@@ -1684,18 +1692,22 @@ impl Filesystem for OnDemandFs {
         let shared = self.shared.clone();
         let name_owned = name.to_os_string();
         // lookup 未命中会走远端 ls —— 必须在池里跑，不能阻塞派发线程
-        let _ = shared.ops.clone().submit("lookup", Box::new(move || {
-            match shared.rt.block_on(shared.resolve_child(parent, &name_owned)) {
-                Ok(Some(ino)) => match Self::attr_of(&shared, ino) {
-                    Ok(attr) => {
-                        reply.entry(&ATTR_TTL, &attr, 0)
-                    }
-                    Err(_) => reply.error(libc::ENOENT),
-                },
-                Ok(None) => reply.error(libc::ENOENT),
-                Err(_) => reply.error(libc::EIO),
-            }
-        }));
+        let _ = shared.ops.clone().submit(
+            "lookup",
+            Box::new(move || {
+                match shared
+                    .rt
+                    .block_on(shared.resolve_child(parent, &name_owned))
+                {
+                    Ok(Some(ino)) => match Self::attr_of(&shared, ino) {
+                        Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
+                        Err(_) => reply.error(libc::ENOENT),
+                    },
+                    Ok(None) => reply.error(libc::ENOENT),
+                    Err(_) => reply.error(libc::EIO),
+                }
+            }),
+        );
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
@@ -1727,76 +1739,58 @@ impl Filesystem for OnDemandFs {
     ) {
         let shared = self.shared.clone();
         // 尺寸变更可能触发 hydrate；交给池线程执行，避免卡派发循环
-        let _ = shared.ops.clone().submit("create", Box::new(move || {
-            let result: Result<()> = shared.rt.block_on(async {
-                let kind = {
-                    let inode = shared.inodes.get(&ino).ok_or_else(|| anyhow!("no inode"))?;
-                    let node = inode.read();
-                    node.kind
-                };
-                // chmod：目录也必须支持（回收站要求 .Trash 为 1777 粘滞目录）
-                if let Some(m) = mode {
-                    if let Some(inode) = shared.inodes.get(&ino) {
-                        inode.write().mode = m & 0o7777;
-                    }
-                }
-                if kind != FileType::RegularFile {
-                    if let Some(TimeOrNow::SpecificTime(t)) = mtime {
-                        if let Some(inode) = shared.inodes.get(&ino) {
-                            inode.write().mtime = secs_of(t);
-                        }
-                    }
-                    return Ok(());
-                }
-                if let Some(new_size) = size {
-                    let rel = {
+        let _ = shared.transfer_ops.clone().submit(
+            "setattr",
+            Box::new(move || {
+                let result: Result<()> = shared.rt.block_on(async {
+                    let kind = {
                         let inode = shared.inodes.get(&ino).ok_or_else(|| anyhow!("no inode"))?;
                         let node = inode.read();
-                        node.rel.clone()
+                        node.kind
                     };
-                    // 截断（可能落在未缓存的占位文件上）
-                    let file = shared.open_handle(ino)?;
-                    file.lock().set_len(new_size)?;
-                    let now = now_secs();
-                    shared.cache.ensure_state(&rel, (0, 0), now);
-                    shared.cache.update(&rel, |s| {
-                        s.size = new_size;
-                        s.dirty = true;
-                        s.mtime = now;
-                    });
-                    if let Some(inode) = shared.inodes.get(&ino) {
-                        let mut node = inode.write();
-                        node.dirty = true;
-                        node.size = new_size;
-                        node.mtime = now;
-                    }
-                    shared.mark_meta_dirty();
-                } else if let Some(t) = mtime {
-                    let secs = match t {
-                        TimeOrNow::SpecificTime(t) => secs_of(t),
-                        TimeOrNow::Now => now_secs(),
-                    };
-                    if let Some(inode) = shared.inodes.get(&ino) {
-                        let mut node = inode.write();
-                        let rel = node.rel.clone();
-                        if node.dirty {
-                            node.mtime = secs;
-                            shared.cache.update(&rel, |s| s.mtime = secs);
-                        } else {
-                            node.mtime = secs;
+                    // chmod：目录也必须支持（回收站要求 .Trash 为 1777 粘滞目录）
+                    if let Some(m) = mode {
+                        if let Some(inode) = shared.inodes.get(&ino) {
+                            inode.write().mode = m & 0o7777;
                         }
                     }
+                    if kind != FileType::RegularFile {
+                        if let Some(TimeOrNow::SpecificTime(t)) = mtime {
+                            if let Some(inode) = shared.inodes.get(&ino) {
+                                inode.write().mtime = secs_of(t);
+                            }
+                        }
+                        return Ok(());
+                    }
+                    if let Some(new_size) = size {
+                        shared.resize_content(ino, new_size).await?;
+                    } else if let Some(t) = mtime {
+                        let secs = match t {
+                            TimeOrNow::SpecificTime(t) => secs_of(t),
+                            TimeOrNow::Now => now_secs(),
+                        };
+                        if let Some(inode) = shared.inodes.get(&ino) {
+                            let mut node = inode.write();
+                            let rel = node.rel.clone();
+                            if node.dirty {
+                                node.mtime = secs;
+                                shared.cache.update(&rel, |s| s.mtime = secs);
+                            } else {
+                                node.mtime = secs;
+                            }
+                        }
+                    }
+                    Ok(())
+                });
+                match result {
+                    Ok(()) => match Self::attr_of(&shared, ino) {
+                        Ok(attr) => reply.attr(&ATTR_TTL, &attr),
+                        Err(_) => reply.error(libc::ENOENT),
+                    },
+                    Err(_) => reply.error(libc::EIO),
                 }
-                Ok(())
-            });
-            match result {
-                Ok(()) => match Self::attr_of(&shared, ino) {
-                    Ok(attr) => reply.attr(&ATTR_TTL, &attr),
-                    Err(_) => reply.error(libc::ENOENT),
-                },
-                Err(_) => reply.error(libc::EIO),
-            }
-        }));
+            }),
+        );
     }
 
     fn mknod(
@@ -1824,18 +1818,26 @@ impl Filesystem for OnDemandFs {
     ) {
         let shared = self.shared.clone();
         let name = name.to_os_string();
-        let _ = shared.ops.clone().submit("mkdir", Box::new(move || {
-            match shared.rt.block_on(shared.resolve_new_file(parent, &name)) {
-                Ok(ino) => {
-                    let _ = shared.open_handle(ino);
-                    match Self::attr_of(&shared, ino) {
-                        Ok(attr) => reply.created(&ATTR_TTL, &attr, 0, ino, 0),
-                        Err(_) => reply.error(libc::EIO),
+        let _ = shared.ops.clone().submit(
+            "mkdir",
+            Box::new(
+                move || match shared.rt.block_on(shared.resolve_new_file(parent, &name)) {
+                    Ok(ino) => {
+                        shared.inc_open(ino);
+                        if shared.open_handle(ino).is_err() {
+                            shared.dec_open(ino);
+                            reply.error(libc::EIO);
+                            return;
+                        }
+                        match Self::attr_of(&shared, ino) {
+                            Ok(attr) => reply.created(&ATTR_TTL, &attr, 0, ino, 0),
+                            Err(_) => reply.error(libc::EIO),
+                        }
                     }
-                }
-                Err(_) => reply.error(libc::EIO),
-            }
-        }));
+                    Err(_) => reply.error(libc::EIO),
+                },
+            ),
+        );
     }
 
     fn mkdir(
@@ -1849,37 +1851,46 @@ impl Filesystem for OnDemandFs {
     ) {
         let shared = self.shared.clone();
         let name = name.to_os_string();
-        let _ = shared.ops.clone().submit("unlink", Box::new(move || {
-            match shared.rt.block_on(shared.do_mkdir(parent, &name)) {
-                Ok(ino) => match Self::attr_of(&shared, ino) {
-                    Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
+        let _ = shared.ops.clone().submit(
+            "unlink",
+            Box::new(
+                move || match shared.rt.block_on(shared.do_mkdir(parent, &name)) {
+                    Ok(ino) => match Self::attr_of(&shared, ino) {
+                        Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
+                        Err(_) => reply.error(libc::EIO),
+                    },
                     Err(_) => reply.error(libc::EIO),
                 },
-                Err(_) => reply.error(libc::EIO),
-            }
-        }));
+            ),
+        );
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let shared = self.shared.clone();
         let name = name.to_os_string();
-        let _ = shared.ops.clone().submit("rmdir", Box::new(move || {
-            match shared.rt.block_on(shared.do_remove(parent, &name)) {
-                Ok(()) => reply.ok(),
-                Err(_) => reply.error(libc::EIO),
-            }
-        }));
+        let _ = shared.ops.clone().submit(
+            "rmdir",
+            Box::new(
+                move || match shared.rt.block_on(shared.do_remove(parent, &name)) {
+                    Ok(()) => reply.ok(),
+                    Err(_) => reply.error(libc::EIO),
+                },
+            ),
+        );
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let shared = self.shared.clone();
         let name = name.to_os_string();
-        let _ = shared.ops.clone().submit("rename", Box::new(move || {
-            match shared.rt.block_on(shared.do_remove(parent, &name)) {
-                Ok(()) => reply.ok(),
-                Err(_) => reply.error(libc::EIO),
-            }
-        }));
+        let _ = shared.ops.clone().submit(
+            "rename",
+            Box::new(
+                move || match shared.rt.block_on(shared.do_remove(parent, &name)) {
+                    Ok(()) => reply.ok(),
+                    Err(_) => reply.error(libc::EIO),
+                },
+            ),
+        );
     }
 
     fn rename(
@@ -1895,16 +1906,19 @@ impl Filesystem for OnDemandFs {
         let shared = self.shared.clone();
         let name = name.to_os_string();
         let newname = newname.to_os_string();
-        let _ = shared.ops.clone().submit("open", Box::new(move || {
-            match shared
-                .rt
-                .block_on(shared.do_rename(parent, &name, newparent, &newname))
-            {
-                Ok(()) => reply.ok(),
-                Err(e) if e.to_string().contains("cross-device") => reply.error(libc::EXDEV),
-                Err(_) => reply.error(libc::EIO),
-            }
-        }));
+        let _ = shared.ops.clone().submit(
+            "open",
+            Box::new(move || {
+                match shared
+                    .rt
+                    .block_on(shared.do_rename(parent, &name, newparent, &newname))
+                {
+                    Ok(()) => reply.ok(),
+                    Err(e) if e.to_string().contains("cross-device") => reply.error(libc::EXDEV),
+                    Err(_) => reply.error(libc::EIO),
+                }
+            }),
+        );
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
@@ -1916,48 +1930,40 @@ impl Filesystem for OnDemandFs {
             reply.opened(ino, 0);
             return;
         }
+        shared.inc_open(ino);
         // 写打开未缓存文件：先 hydrate 再回复（池线程，绝不占用派发线程）
-        let _ = shared.ops.clone().submit("read", Box::new(move || {
-            let result: Result<()> = shared.rt.block_on(async {
-                let (rel, dirty, size) = {
-                    let inode = shared.inodes.get(&ino).ok_or_else(|| anyhow!("no inode"))?;
-                    let node = inode.read();
-                    (node.rel.clone(), node.dirty, node.size)
-                };
-                if truncate {
-                    // O_TRUNC：本地置空（内容将被替换，无需下载）
-                    let file = shared.open_handle(ino)?;
-                    file.lock().set_len(0)?;
-                    let now = now_secs();
-                    shared.cache.ensure_state(&rel, (0, 0), now);
-                    shared.cache.update(&rel, |s| {
-                        s.size = 0;
-                        s.dirty = true;
-                        s.mtime = now;
-                    });
-                    if let Some(inode) = shared.inodes.get(&ino) {
-                        let mut node = inode.write();
-                        node.dirty = true;
-                        node.size = 0;
-                        node.mtime = now;
+        let cleanup = shared.clone();
+        let accepted = shared.transfer_ops.clone().submit(
+            "open-write",
+            Box::new(move || {
+                let result: Result<()> = shared.rt.block_on(async {
+                    let (rel, dirty, size) = {
+                        let inode = shared.inodes.get(&ino).ok_or_else(|| anyhow!("no inode"))?;
+                        let node = inode.read();
+                        (node.rel.clone(), node.dirty, node.size)
+                    };
+                    if truncate {
+                        shared.resize_content(ino, 0).await?;
+                        return Ok(());
                     }
-                    shared.mark_meta_dirty();
-                    return Ok(());
+                    if !dirty && size > 0 && !shared.cache.downloaded(&rel) {
+                        shared.hydrate(ino).await?;
+                    }
+                    let _ = shared.open_handle(ino)?;
+                    Ok(())
+                });
+                match result {
+                    Ok(()) => reply.opened(ino, 0),
+                    Err(_) => {
+                        shared.dec_open(ino);
+                        reply.error(libc::EIO)
+                    }
                 }
-                if !dirty && size > 0 && !shared.cache.downloaded(&rel) {
-                    shared.hydrate(ino).await?;
-                }
-                let _ = shared.open_handle(ino)?;
-                Ok(())
-            });
-            match result {
-                Ok(()) => {
-                    shared.inc_open(ino);
-                    reply.opened(ino, 0)
-                }
-                Err(_) => reply.error(libc::EIO),
-            }
-        }));
+            }),
+        );
+        if !accepted {
+            cleanup.dec_open(ino);
+        }
     }
 
     fn read(
@@ -1980,23 +1986,21 @@ impl Filesystem for OnDemandFs {
         // 快路径要求“状态匹配 **且** 内容确实在磁盘上”。缺了后者，一旦缓存文件
         // 被清掉而状态还在，open_handle 的 create(true) 会造出空文件并返回 0 字节。
         let fast = match shared.cache.state(&rel) {
-            Some(state) => !state.dirty
-                && shared
-                    .inodes
-                    .get(&ino)
-                    .map(|n| {
-                        let node = n.read();
-                        node.stamp == state.stamp && node.size == state.size
-                    })
-                    .unwrap_or(false)
-                && shared.cached_content_ok(
-                    &rel,
-                    shared
+            Some(state) => {
+                !state.dirty
+                    && shared
                         .inodes
                         .get(&ino)
-                        .map(|n| n.read().size)
-                        .unwrap_or(0),
-                ),
+                        .map(|n| {
+                            let node = n.read();
+                            node.stamp == state.stamp && node.size == state.size
+                        })
+                        .unwrap_or(false)
+                    && shared.cached_content_ok(
+                        &rel,
+                        shared.inodes.get(&ino).map(|n| n.read().size).unwrap_or(0),
+                    )
+            }
             None => false,
         };
         if fast {
@@ -2012,20 +2016,27 @@ impl Filesystem for OnDemandFs {
             }
             return;
         }
-        // 慢路径：需要下载（等价官方 DemandWriter），池线程执行
-        let _ = shared.ops.clone().submit("write", Box::new(move || {
-            let result = shared.rt.block_on(async {
+        // Waiting for the same file never occupies an OS worker thread.
+        let Ok(slot) = shared.read_slots.clone().try_acquire_owned() else {
+            reply.error(libc::EAGAIN);
+            return;
+        };
+        let rt = shared.rt.clone();
+        rt.spawn(async move {
+            let _slot = slot;
+            let result = async {
                 shared.hydrate(ino).await?;
                 let file = shared.open_handle(ino)?;
                 let mut buf = vec![0u8; size as usize];
                 let n = file.lock().read_at(&mut buf, offset.max(0) as u64)?;
                 Ok::<Vec<u8>, anyhow::Error>(buf[..n].to_vec())
-            });
+            }
+            .await;
             match result {
                 Ok(bytes) => reply.data(&bytes),
                 Err(_) => reply.error(libc::EIO),
             }
-        }));
+        });
     }
 
     fn write(
@@ -2053,26 +2064,40 @@ impl Filesystem for OnDemandFs {
         };
         let data_len = data.len() as u32;
         if need_hydrate {
-            let _ = shared.ops.clone().submit("fsync", Box::new(move || {
-                let result = shared.rt.block_on(async {
-                    shared.hydrate(ino).await?;
-                    apply_write(&shared, ino, off, &data).await
-                });
-                match result {
-                    Ok(()) => reply.written(data_len),
-                    Err(_) => reply.error(libc::EIO),
-                }
-            }));
+            let _ = shared.transfer_ops.clone().submit(
+                "write-hydrate",
+                Box::new(move || {
+                    let result = shared.rt.block_on(async {
+                        shared.hydrate(ino).await?;
+                        apply_write(&shared, ino, off, &data).await
+                    });
+                    match result {
+                        Ok(()) => reply.written(data_len),
+                        Err(_) => reply.error(libc::EIO),
+                    }
+                }),
+            );
         } else {
-            let result = shared.rt.block_on(apply_write(&shared, ino, off, &data));
-            match result {
-                Ok(()) => reply.written(data_len),
-                Err(_) => reply.error(libc::EIO),
-            }
+            let _ = shared.transfer_ops.clone().submit(
+                "write",
+                Box::new(
+                    move || match shared.rt.block_on(apply_write(&shared, ino, off, &data)) {
+                        Ok(()) => reply.written(data_len),
+                        Err(_) => reply.error(libc::EIO),
+                    },
+                ),
+            );
         }
     }
 
-    fn flush(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+    fn flush(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
         let shared = self.shared.clone();
         // 上传异步执行；失败由 worker 重试
         let rt = shared.rt.clone();
@@ -2106,15 +2131,23 @@ impl Filesystem for OnDemandFs {
         reply.ok();
     }
 
-    fn fsync(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         let shared = self.shared.clone();
         // fsync 会等待一次完整上传（含多次网络 RPC），必须离开派发线程
-        let _ = shared.ops.clone().submit("readdir", Box::new(move || {
-            match shared.rt.block_on(shared.upload_ino(ino)) {
+        let _ = shared.transfer_ops.clone().submit(
+            "fsync",
+            Box::new(move || match shared.rt.block_on(shared.upload_ino(ino)) {
                 Ok(()) => reply.ok(),
                 Err(_) => reply.error(libc::EIO),
-            }
-        }));
+            }),
+        );
     }
 
     fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
@@ -2131,9 +2164,10 @@ impl Filesystem for OnDemandFs {
     ) {
         let shared = self.shared.clone();
         // readdir 未命中 TTL 就要远端 ls —— 池线程执行
-        let _ = shared.ops.clone().submit("setattr", Box::new(move || {
-            Self::readdir_impl(&shared, ino, offset, reply)
-        }));
+        let _ = shared.ops.clone().submit(
+            "setattr",
+            Box::new(move || Self::readdir_impl(&shared, ino, offset, reply)),
+        );
     }
 
     fn releasedir(
@@ -2180,10 +2214,7 @@ impl Filesystem for OnDemandFs {
         size: u32,
         reply: ReplyXattr,
     ) {
-        let Some(value) = self
-            .shared
-            .xattr_value(ino, &name.to_string_lossy())
-        else {
+        let Some(value) = self.shared.xattr_value(ino, &name.to_string_lossy()) else {
             return reply.error(libc::ENODATA);
         };
         if size == 0 {
@@ -2306,7 +2337,8 @@ impl OnDemandFs {
         listing.extend(extra);
         listing.sort_by(|a, b| a.2.cmp(&b.2));
 
-        for (i, (child_ino, kind, name)) in listing.iter().enumerate().skip(offset.max(0) as usize) {
+        for (i, (child_ino, kind, name)) in listing.iter().enumerate().skip(offset.max(0) as usize)
+        {
             if reply.add(*child_ino, (i + 1) as i64, *kind, OsStr::new(name)) {
                 break;
             }
@@ -2326,18 +2358,21 @@ impl OnDemandFs {
     fn do_create(&mut self, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let shared = self.shared.clone();
         let name = name.to_os_string();
-        let _ = shared.ops.clone().submit("do_create", Box::new(move || {
-            match shared.rt.block_on(shared.resolve_new_file(parent, &name)) {
-                Ok(ino) => {
-                    let _ = shared.open_handle(ino);
-                    match Self::attr_of(&shared, ino) {
-                        Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
-                        Err(_) => reply.error(libc::EIO),
+        let _ = shared.ops.clone().submit(
+            "do_create",
+            Box::new(
+                move || match shared.rt.block_on(shared.resolve_new_file(parent, &name)) {
+                    Ok(ino) => {
+                        let _ = shared.open_handle(ino);
+                        match Self::attr_of(&shared, ino) {
+                            Ok(attr) => reply.entry(&ATTR_TTL, &attr, 0),
+                            Err(_) => reply.error(libc::EIO),
+                        }
                     }
-                }
-                Err(_) => reply.error(libc::EIO),
-            }
-        }));
+                    Err(_) => reply.error(libc::EIO),
+                },
+            ),
+        );
     }
 }
 
@@ -2352,7 +2387,10 @@ impl Shared {
         }
         let entries = self.list_dir(parent).await?;
         let parent_rel = {
-            let inode = self.inodes.get(&parent).ok_or_else(|| anyhow!("no inode"))?;
+            let inode = self
+                .inodes
+                .get(&parent)
+                .ok_or_else(|| anyhow!("no inode"))?;
             let node = inode.read();
             node.rel.clone()
         };
@@ -2452,7 +2490,10 @@ impl Shared {
             anyhow::bail!("invalid name");
         }
         let parent_rel = {
-            let inode = self.inodes.get(&parent).ok_or_else(|| anyhow!("no inode"))?;
+            let inode = self
+                .inodes
+                .get(&parent)
+                .ok_or_else(|| anyhow!("no inode"))?;
             let node = inode.read();
             node.rel.clone()
         };
@@ -2497,7 +2538,10 @@ impl Shared {
     async fn do_remove(&self, parent: u64, name: &OsStr) -> Result<()> {
         let name_s = name.to_string_lossy().to_string();
         let parent_rel = {
-            let inode = self.inodes.get(&parent).ok_or_else(|| anyhow!("no inode"))?;
+            let inode = self
+                .inodes
+                .get(&parent)
+                .ok_or_else(|| anyhow!("no inode"))?;
             let node = inode.read();
             node.rel.clone()
         };
@@ -2565,17 +2609,31 @@ impl Shared {
         let name_s = name.to_string_lossy().to_string();
         let new_s = newname.to_string_lossy().to_string();
         let parent_rel = {
-            let inode = self.inodes.get(&parent).ok_or_else(|| anyhow!("no inode"))?;
+            let inode = self
+                .inodes
+                .get(&parent)
+                .ok_or_else(|| anyhow!("no inode"))?;
             let node = inode.read();
             node.rel.clone()
         };
         let newparent_rel = {
-            let inode = self.inodes.get(&newparent).ok_or_else(|| anyhow!("no inode"))?;
+            let inode = self
+                .inodes
+                .get(&newparent)
+                .ok_or_else(|| anyhow!("no inode"))?;
             let node = inode.read();
             node.rel.clone()
         };
-        let rel = if parent_rel.is_empty() { name_s.clone() } else { format!("{parent_rel}/{name_s}") };
-        let new_rel = if newparent_rel.is_empty() { new_s.clone() } else { format!("{newparent_rel}/{new_s}") };
+        let rel = if parent_rel.is_empty() {
+            name_s.clone()
+        } else {
+            format!("{parent_rel}/{name_s}")
+        };
+        let new_rel = if newparent_rel.is_empty() {
+            new_s.clone()
+        } else {
+            format!("{newparent_rel}/{new_s}")
+        };
 
         let into_trash = Self::is_local_only(&new_rel);
         let out_of_trash = Self::is_local_only(&rel) && !into_trash;
@@ -2658,7 +2716,9 @@ impl Shared {
         // 跨目录改名：只对“移入/移出回收站”放行，其余仍拒绝
         // （挂载内跨目录移动需要远端 move 语义，暂不支持）。
         if parent != newparent {
-            return self.rename_with_trash(parent, name, newparent, newname).await;
+            return self
+                .rename_with_trash(parent, name, newparent, newname)
+                .await;
         }
         let name_s = name.to_string_lossy().to_string();
         let new_s = newname.to_string_lossy().to_string();
@@ -2666,7 +2726,10 @@ impl Shared {
             anyhow::bail!("invalid rename target");
         }
         let parent_rel = {
-            let inode = self.inodes.get(&parent).ok_or_else(|| anyhow!("no inode"))?;
+            let inode = self
+                .inodes
+                .get(&parent)
+                .ok_or_else(|| anyhow!("no inode"))?;
             let node = inode.read();
             node.rel.clone()
         };
@@ -2695,7 +2758,9 @@ impl Shared {
             if let Some(inode) = self.inodes.get(&ino) {
                 let mut node = inode.write();
                 node.rel = new_rel.clone();
-                node.size = std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(node.size);
+                node.size = std::fs::metadata(&dst)
+                    .map(|m| m.len())
+                    .unwrap_or(node.size);
             }
             self.invalidate_parent_listing(parent);
             return Ok(());
@@ -2765,4 +2830,37 @@ pub(crate) fn mount_options() -> Vec<MountOption> {
         MountOption::DefaultPermissions,
         MountOption::RW,
     ]
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+    #[test]
+    fn transfer_saturation_does_not_block_metadata_and_queue_is_bounded() {
+        let transfers = OpPool::new(1);
+        let metadata = OpPool::new(1);
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, begin) = std::sync::mpsc::channel();
+        assert!(transfers.submit(
+            "slow",
+            Box::new(move || {
+                started.send(()).unwrap();
+                wait.recv().unwrap();
+            })
+        ));
+        begin.recv_timeout(Duration::from_secs(1)).unwrap();
+        for _ in 0..128 {
+            assert!(transfers.submit("queued", Box::new(|| {})));
+        }
+        assert!(!transfers.submit("overflow", Box::new(|| {})));
+        let (done, result) = std::sync::mpsc::channel();
+        assert!(metadata.submit(
+            "lookup",
+            Box::new(move || {
+                done.send(()).unwrap();
+            })
+        ));
+        result.recv_timeout(Duration::from_secs(1)).unwrap();
+        release.send(()).unwrap();
+    }
 }

@@ -14,6 +14,7 @@
 //! 运行时依赖：内核 fuse 模块 + `fusermount3`（主流发行版预装）。
 
 pub mod cache;
+pub mod control;
 pub mod fs;
 pub mod remote;
 
@@ -69,6 +70,9 @@ impl OnDemandMount {
         // 顺序很重要：必须在 create_dir_all 之前。死挂载点的 stat/mkdir 会返回
         // ENOTCONN，create_dir_all 因此失败并提前 return，recover 就永远跑不到。
         recover_stale_mount(&cfg.mountpoint);
+        if is_fuse_mount(&cfg.mountpoint) {
+            return Err(anyhow!("旧挂载尚未释放，拒绝重复挂载"));
+        }
         if let Err(e) = std::fs::create_dir_all(&cfg.mountpoint) {
             tracing::warn!(
                 mountpoint = %cfg.mountpoint.display(),
@@ -89,12 +93,20 @@ impl OnDemandMount {
             db,
             filter,
         )?);
+        {
+            let _enter = rt.enter();
+            control::start(shared.clone())?;
+        }
         let filesystem = fs::OnDemandFs {
             shared: shared.clone(),
         };
         let options = fs::mount_options();
-        let session = fuser::Session::new(filesystem, &cfg.mountpoint, &options)
-            .map_err(|e| anyhow!("mount {} failed: {e}", cfg.mountpoint.display()))?;
+        let session = fuser::Session::new(filesystem, &cfg.mountpoint, &options).map_err(|e| {
+            shared
+                .stopping
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            anyhow!("mount {} failed: {e}", cfg.mountpoint.display())
+        })?;
         shared.set_notifier(session.notifier());
         // 独立看门狗线程（不依赖 runtime）：把卡住的回调直接写进日志。
         // 没有它，挂载卡死时进程内所有诊断都停摆，只能靠外部猜。
@@ -120,11 +132,11 @@ impl OnDemandMount {
                 .ok();
         }
         // worker 在独立 runtime 上运行
-        let worker = rt
-            .spawn(shared.clone().worker())
-            .abort_handle();
+        let worker = rt.spawn(shared.clone().worker()).abort_handle();
         let session = session.spawn().map_err(|e| {
-            shared.stopping.store(true, std::sync::atomic::Ordering::Relaxed);
+            shared
+                .stopping
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             anyhow!("background fuse session failed: {e}")
         })?;
         // session 所有者线程：收到 stop 信号后 join（卸载 + 等待派发退出）
@@ -153,6 +165,14 @@ impl OnDemandMount {
         })
     }
 
+    pub fn is_active(&self) -> bool {
+        !self
+            .shared
+            .stopping
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && is_fuse_mount(&self.cfg.mountpoint)
+    }
+
     pub fn mountpoint(&self) -> &std::path::Path {
         &self.cfg.mountpoint
     }
@@ -163,13 +183,17 @@ impl OnDemandMount {
 
     /// 停止 worker、卸载挂载点并关闭 runtime。
     /// 卸载语义为延迟卸载（lazy），打开中的文件收到 EIO 后自然结束。
-    pub fn stop(mut self) {
+    pub fn stop(mut self) -> Result<()> {
         self.shutdown();
+        if is_fuse_mount(&self.cfg.mountpoint) {
+            return Err(anyhow!("挂载尚未释放，请关闭占用程序后重试"));
+        }
         tracing::info!(
             task_id = self.cfg.task_id,
             mountpoint = %self.cfg.mountpoint.display(),
             "on-demand mount stopped"
         );
+        Ok(())
     }
 
     fn shutdown(&mut self) {
@@ -213,6 +237,8 @@ impl OnDemandMount {
                 }
             }
         }
+        // Confirm removal from this mount namespace before another task can remount.
+        recover_stale_mount(&self.cfg.mountpoint);
         // tokio Runtime 不能在异步上下文中 drop；挪到独立线程释放。
         // drop(rt) 会等待 worker 线程退出：若有 block_on 中的回调仍卡着，
         // 这里 join 就会永久不返回，导致“暂停/删除任务”卡死。因此不 join，
@@ -233,7 +259,7 @@ impl Drop for OnDemandMount {
 }
 
 /// 挂载点是否已经是 FUSE 挂载（含我们自己残留的）。
-fn is_fuse_mount(mountpoint: &std::path::Path) -> bool {
+pub(crate) fn is_fuse_mount(mountpoint: &std::path::Path) -> bool {
     let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else {
         return false;
     };
@@ -287,7 +313,9 @@ fn recover_stale_mount(mountpoint: &std::path::Path) {
     );
     // 先试普通卸载：干净、快速，大多数情况足够。
     let plain_ok = run_with_timeout(
-        std::process::Command::new("fusermount3").args(["-u", "--"]).arg(mountpoint),
+        std::process::Command::new("fusermount3")
+            .args(["-u", "--"])
+            .arg(mountpoint),
         Duration::from_secs(3),
     );
     if plain_ok && !is_fuse_mount(mountpoint) {
@@ -297,7 +325,9 @@ fn recover_stale_mount(mountpoint: &std::path::Path) {
     // 普通卸载失败（挂载点仍被进程占用 → EBUSY，或守护进程已死 → ENOTCONN）。
     // 延迟卸载不会等待未完成请求，但可能永久阻塞，因此只给它很短的时间。
     let lazy_ok = run_with_timeout(
-        std::process::Command::new("fusermount3").args(["-u", "-z", "--"]).arg(mountpoint),
+        std::process::Command::new("fusermount3")
+            .args(["-u", "-z", "--"])
+            .arg(mountpoint),
         Duration::from_secs(2),
     );
     if is_fuse_mount(mountpoint) {
@@ -322,7 +352,7 @@ fn run_with_timeout(cmd: &mut std::process::Command, timeout: Duration) -> bool 
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return true,
+            Ok(Some(status)) => return status.success(),
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     // 不杀进程：D 状态无法被杀，等它自己被内核唤醒即可。
@@ -338,7 +368,10 @@ fn run_with_timeout(cmd: &mut std::process::Command, timeout: Duration) -> bool 
 /// 从 system_table 读取缓存上限（字节）。非法/缺失 → 默认值。
 pub async fn cache_limit_from_settings(db: &sqlx::SqlitePool) -> u64 {
     match logs::get_system_value(db, "ondemand_cache_limit_bytes").await {
-        Ok(Some(text)) => text.trim().parse::<u64>().unwrap_or(DEFAULT_CACHE_LIMIT_BYTES),
+        Ok(Some(text)) => text
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(DEFAULT_CACHE_LIMIT_BYTES),
         _ => DEFAULT_CACHE_LIMIT_BYTES,
     }
 }
@@ -356,7 +389,10 @@ rw,user_id=1000,group_id=1000,default_permissions";
 
     #[test]
     fn detects_our_fuse_mount() {
-        assert!(mountinfo_has_fuse(REAL_LINE, "/home/xmlijian/文档/威特文档"));
+        assert!(mountinfo_has_fuse(
+            REAL_LINE,
+            "/home/xmlijian/文档/威特文档"
+        ));
     }
 
     #[test]
@@ -444,7 +480,9 @@ mod mount_tests {
         nas.seed("root/seed.txt", b"remote content");
         nas.seed("root/big.bin", &[b'x'; 4096]);
         let cfg = make_cfg(mountpoint.clone(), tmp.path().join("cache"));
-        let db = database::open_db(&tmp.path().join("db.sqlite")).await.unwrap();
+        let db = database::open_db(&tmp.path().join("db.sqlite"))
+            .await
+            .unwrap();
         database::migrate(&db).await.unwrap();
         let filter = FileFilter::from_db(None);
         let mount = OnDemandMount::start(cfg, nas.clone() as Arc<dyn RemoteOps>, db, filter)
@@ -455,7 +493,10 @@ mod mount_tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert!(names.contains(&"seed.txt".to_string()), "listing: {names:?}");
+        assert!(
+            names.contains(&"seed.txt".to_string()),
+            "listing: {names:?}"
+        );
 
         // 2. 占位文件：只读元数据不下载
         let meta = std::fs::metadata(mountpoint.join("big.bin")).unwrap();
@@ -491,8 +532,7 @@ mod mount_tests {
         std::fs::remove_file(&cached).unwrap();
         let reread = std::fs::read(mountpoint.join("seed.txt")).unwrap();
         assert_eq!(
-            reread,
-            b"remote content",
+            reread, b"remote content",
             "must re-download instead of returning an empty file"
         );
         assert_eq!(
@@ -549,7 +589,9 @@ mod mount_tests {
         // 6. 改名 → NAS 同步改名
         std::fs::rename(mountpoint.join("big.bin"), mountpoint.join("big2.bin")).unwrap();
         assert!(
-            wait_until(500, || nas.exists("root/big2.bin") && !nas.exists("root/big.bin")).await,
+            wait_until(500, || nas.exists("root/big2.bin")
+                && !nas.exists("root/big.bin"))
+            .await,
             "remote rename propagated"
         );
         assert_eq!(
@@ -582,14 +624,12 @@ mod mount_tests {
         );
         std::fs::write(mountpoint.join("c.txt"), b"local edit").unwrap();
         assert!(
-            wait_until(8000, || nas.read("root/c.txt").as_deref() == Some(&b"local edit"[..]))
-                .await,
+            wait_until(8000, || nas.read("root/c.txt").as_deref()
+                == Some(&b"local edit"[..]))
+            .await,
             "local edit uploaded"
         );
-        let conflicted: Vec<Vec<u8>> = nas
-            .snapshot_conflicted("root/c.txt")
-            .into_iter()
-            .collect();
+        let conflicted: Vec<Vec<u8>> = nas.snapshot_conflicted("root/c.txt").into_iter().collect();
         assert!(
             conflicted.contains(&b"v2-changed".to_vec()),
             "conflicted copy keeps remote version, got {conflicted:?}"
@@ -611,7 +651,7 @@ mod mount_tests {
             t0.elapsed()
         );
 
-        mount.stop();
+        mount.stop().unwrap();
         // 卸载后挂载点不再是 fuse
         let out = std::process::Command::new("mountpoint")
             .arg(&mountpoint)
@@ -702,10 +742,12 @@ mod mount_tests {
         fake.seed("root/a.txt", b"alpha");
         let nas: Arc<dyn RemoteOps> = Arc::new(SlowNas(fake.clone()));
         let cfg = make_cfg(mountpoint.clone(), tmp.path().join("cache"));
-        let db = database::open_db(&tmp.path().join("db.sqlite")).await.unwrap();
+        let db = database::open_db(&tmp.path().join("db.sqlite"))
+            .await
+            .unwrap();
         database::migrate(&db).await.unwrap();
-        let mount = OnDemandMount::start(cfg, nas, db, FileFilter::from_db(None))
-            .expect("mount started");
+        let mount =
+            OnDemandMount::start(cfg, nas, db, FileFilter::from_db(None)).expect("mount started");
 
         // 先在后台制造持续并发访问：每个请求都可能触发 2 秒的远端 ls。
         let mp = mountpoint.clone();
@@ -737,7 +779,7 @@ mod mount_tests {
 
         stop_pump.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = pump.join();
-        mount.stop();
+        mount.stop().unwrap();
         // 卸挂必须能完成（修复前 join 会永久卡住）
         let out = std::process::Command::new("mountpoint")
             .arg(&mountpoint)

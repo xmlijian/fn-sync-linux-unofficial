@@ -129,7 +129,6 @@ impl CacheMgr {
 
     pub fn remove(&self, rel: &str) {
         self.entries.remove(rel);
-        self.locks.remove(rel);
     }
 
     pub fn downloaded(&self, rel: &str) -> bool {
@@ -201,8 +200,7 @@ impl CacheMgr {
             if total <= self.limit {
                 break;
             }
-            self.entries.remove(&rel);
-            self.locks.remove(&rel);
+
             total = total.saturating_sub(size);
             evicted.push(rel);
         }
@@ -263,7 +261,11 @@ impl CacheMgr {
             self.entries.insert(
                 rel.clone(),
                 CacheState {
-                    size: if file_meta.len() > 0 { file_meta.len() } else { size },
+                    size: if file_meta.len() > 0 {
+                        file_meta.len()
+                    } else {
+                        size
+                    },
                     dirty: true,
                     uploading: false,
                     stamp,
@@ -336,6 +338,12 @@ mod tests {
         // 上限 100 → 淘汰最久未用的 a.bin
         let evicted = mgr.plan_eviction(&|_| false, &|_| false);
         assert_eq!(evicted, vec!["a.bin".to_string()]);
+        assert_eq!(
+            mgr.total_size(),
+            120,
+            "selection must not mutate cache before deletion succeeds"
+        );
+        mgr.remove("a.bin");
         assert_eq!(mgr.total_size(), 60);
     }
 
@@ -402,5 +410,18 @@ mod tests {
         .unwrap();
         mgr.load_meta();
         assert!(mgr.state("ghost.bin").is_none(), "文件不在就不恢复");
+    }
+}
+
+#[cfg(test)]
+mod stable_lock_tests {
+    use super::*;
+    #[test]
+    fn removing_content_keeps_path_serialization() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = CacheMgr::new(root.path().into(), 1024).unwrap();
+        let before = cache.lock_for("a");
+        cache.remove("a");
+        assert!(Arc::ptr_eq(&before, &cache.lock_for("a")));
     }
 }

@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Daemon-owned on-demand commands; no direct cache file mutations."""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+sys.path.insert(0, "/usr/lib/fn-sync-client")
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from fnsync_ipc import locate, request
+
+
+def notify(title, body):
+    try:
+        subprocess.Popen(["notify-send", "-a", "飞牛同步", "-r", str(9000 + os.getpid() % 900), title, body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=["download", "free", "pin", "unpin", "status"])
+    parser.add_argument("paths", nargs="*", default=["."])
+    args = parser.parse_args()
+    failed = 0
+    for path in args.paths or ["."]:
+        try:
+            sock, rel, status = locate(path)
+            if args.action == "status":
+                print(json.dumps(status, ensure_ascii=False, indent=2))
+                continue
+            files = request(sock, "list", rel, timeout=60)["files"]
+            notify("正在处理", f"{len(files)} 个文件")
+            for name in files:
+                request(sock, args.action, name, timeout=30)
+                if args.action in ("download", "pin"):
+                    last = None
+                    while True:
+                        states = request(sock, "status")["files"]
+                        state = next((x for x in states if x["path"] == name), None)
+                        if not state:
+                            raise RuntimeError("文件状态已失效，请重试")
+                        if state.get("error"):
+                            raise RuntimeError(state["error"])
+                        if state["state"] in ("cached", "dirty"):
+                            break
+                        if state["progress"] != last:
+                            last = state["progress"]
+                            notify(f"下载中 {last}%", f'{name}\n{state["done"]} / {state["total"]} 字节')
+                        time.sleep(0.5)
+                print(f"{args.action}: {name}")
+            notify("操作完成", f"{args.action}: {len(files)} 个文件")
+        except (OSError, ValueError, RuntimeError) as error:
+            failed += 1
+            print(f"{path}: {error}", file=sys.stderr)
+            notify("操作失败", str(error))
+    return bool(failed)
+
+if __name__ == "__main__":
+    sys.exit(main())

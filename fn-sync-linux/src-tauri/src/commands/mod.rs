@@ -189,21 +189,14 @@ pub async fn update_task_status(
 
 #[tauri::command]
 pub async fn delete_task(state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    state.task_manager.lock().await.stop_task(id).await;
+    state.task_manager.lock().await.stop_task(id).await.map_err(|e| e.to_string())?;
     tasks::delete_task(db(&state), id)
         .await
         .map_err(|e| e.to_string())?;
-    // 按需同步缓存清理：存在未上传的本地修改时保留（避免丢数据），否则删除
-    if let Ok(cache_dir) = crate::platform::app_data_dir().map(|d| d.join("ondemand").join(id.to_string())) {
-        if cache_dir.exists() {
-            let meta = std::fs::read_to_string(cache_dir.join(".meta.json")).unwrap_or_default();
-            if meta.trim().is_empty() || meta.contains("\"dirty\":{}") {
-                let _ = std::fs::remove_dir_all(&cache_dir);
-            } else {
-                tracing::warn!(task_id = id, "on-demand cache kept: pending uploads exist");
-            }
-        }
-    }
+    // Keep cache on task deletion. A missing/stale metadata file cannot prove that
+    // all local writes reached the NAS, and detached callbacks may still be draining.
+    tracing::info!(task_id=id, "task removed; local on-demand cache retained for recovery");
+
     Ok(())
 }
 
@@ -231,7 +224,7 @@ pub async fn resume_task(state: State<'_, AppState>, task_id: i64) -> Result<(),
 
 #[tauri::command]
 pub async fn reload_task(state: State<'_, AppState>, task_id: i64) -> Result<(), String> {
-    state.task_manager.lock().await.stop_task(task_id).await;
+    state.task_manager.lock().await.stop_task(task_id).await.map_err(|e| e.to_string())?;
     let task = tasks::get_task_by_id(db(&state), task_id)
         .await
         .map_err(|e| e.to_string())?
@@ -1580,7 +1573,7 @@ pub async fn network_restart(state: State<'_, AppState>, task_id: i64) -> Result
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "nas account not found".to_string())?;
     let mgr = state.task_manager.lock().await;
-    mgr.stop_task(task_id).await;
+    mgr.stop_task(task_id).await.map_err(|e| e.to_string())?;
     mgr.delete_client(acc_id as u64);
     mgr.start_task(db(&state), task_id, &account)
         .await

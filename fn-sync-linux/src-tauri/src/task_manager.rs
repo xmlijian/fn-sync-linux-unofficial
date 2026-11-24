@@ -34,7 +34,7 @@ impl RunningKind {
     fn is_active(&self) -> bool {
         match self {
             Self::Sync(t) => !t.abort.is_finished(),
-            Self::OnDemand { .. } => true,
+            Self::OnDemand { mount, .. } => mount.is_active(),
         }
     }
 }
@@ -48,6 +48,7 @@ pub struct TaskManager {
     /// 按账号的建连闸门：并发请求只让一个真正建连。
     account_locks: Arc<DashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
     running: DashMap<i64, RunningKind>,
+    failed_stops: DashMap<i64, std::path::PathBuf>,
     traffic: TrafficCounter,
 }
 
@@ -155,6 +156,7 @@ impl TaskManager {
             account_clients: Arc::new(DashMap::new()),
             account_locks: Arc::new(DashMap::new()),
             running: DashMap::new(),
+            failed_stops: DashMap::new(),
             traffic: TrafficCounter::new(),
         }
     }
@@ -404,7 +406,13 @@ impl TaskManager {
         Ok(())
     }
 
-    pub async fn stop_task(&self, task_id: i64) {
+    pub async fn stop_task(&self, task_id: i64) -> Result<()> {
+        if let Some(path) = self.failed_stops.get(&task_id) {
+            if crate::tasks::ondemand::is_fuse_mount(path.value()) {
+                return Err(anyhow!("上次停止未完成，挂载仍在使用中"));
+            }
+        }
+        self.failed_stops.remove(&task_id);
         if let Some((_, kind)) = self.running.remove(&task_id) {
             match kind {
                 RunningKind::Sync(r) => {
@@ -413,17 +421,29 @@ impl TaskManager {
                 }
                 RunningKind::OnDemand { mount, .. } => {
                     // 卸载可能阻塞到派发线程退出；放到阻塞线程池
-                    let _ = tokio::task::spawn_blocking(move || mount.stop()).await;
+                    let path = mount.mountpoint().to_path_buf();
+                    let stopped = tokio::task::spawn_blocking(move || mount.stop()).await;
+                    let result = match stopped {
+                        Ok(result) => result,
+                        Err(error) => Err(anyhow!("mount shutdown failed: {error}")),
+                    };
+                    if let Err(error) = result {
+                        self.failed_stops.insert(task_id, path);
+                        return Err(error);
+                    }
                 }
             }
         }
+        Ok(())
     }
 
     /// 停止全部任务（进程退出时卸载所有按需挂载点）。
     pub async fn stop_all(&self) {
         let ids: Vec<i64> = self.running.iter().map(|e| *e.key()).collect();
         for id in ids {
-            self.stop_task(id).await;
+            if let Err(error) = self.stop_task(id).await {
+                tracing::error!(task_id=id, %error, "task shutdown failed");
+            }
         }
     }
 
@@ -434,7 +454,7 @@ impl TaskManager {
         {
             return Err(anyhow!("task not found"));
         }
-        self.stop_task(task_id).await;
+        self.stop_task(task_id).await?;
         crate::service::tasks::update_task_status(db, task_id, crate::tasks::actor::status::PAUSED)
             .await?;
         tracing::info!(task_id, "task paused; executor stopped");
@@ -448,7 +468,7 @@ impl TaskManager {
         let account = crate::service::nas_account::get_nas_account_by_id(db, task.nas_acc_id)
             .await?
             .ok_or_else(|| anyhow!("account not found"))?;
-        self.stop_task(task_id).await;
+        self.stop_task(task_id).await?;
         crate::service::tasks::update_task_status(
             db,
             task_id,
@@ -484,7 +504,7 @@ impl TaskManager {
             .iter()
             .filter(|r| match r.value() {
                 RunningKind::Sync(t) => !t.abort.is_finished() && !t.actor.is_paused(),
-                RunningKind::OnDemand { .. } => true,
+                RunningKind::OnDemand { mount, .. } => mount.is_active(),
             })
             .count()
     }
@@ -500,7 +520,9 @@ impl TaskManager {
             .map(|e| *e.key())
             .collect();
         for id in ids {
-            self.stop_task(id).await;
+            if let Err(error) = self.stop_task(id).await {
+                tracing::error!(task_id=id, %error, "task shutdown failed");
+            }
         }
     }
 }
@@ -647,7 +669,7 @@ mod live_lifecycle_tests {
             .await
             .unwrap();
         wait_contents(&local.join("state.txt"), b"network-recovered").await;
-        manager.stop_task(id).await;
+        manager.stop_task(id).await.unwrap();
         assert!(!manager.is_running(id));
         replacement
             .upload(
@@ -824,7 +846,7 @@ mod live_pause_inflight_tests {
             })
             .await
             .expect("resume did not finish transfer");
-            manager.stop_task(id).await;
+            manager.stop_task(id).await.unwrap();
             nas.remove(vec![remote]).await.unwrap();
             eprintln!("PASS {mode}: active transfer canceled, paused status retained, resume content verified");
         }

@@ -80,10 +80,7 @@ pub struct ReconnectingRemote {
 }
 
 impl ReconnectingRemote {
-    pub fn new(
-        initial: Option<Arc<dyn RemoteSession>>,
-        connector: SessionConnector,
-    ) -> Arc<Self> {
+    pub fn new(initial: Option<Arc<dyn RemoteSession>>, connector: SessionConnector) -> Arc<Self> {
         Arc::new(Self {
             connector,
             current: RwLock::new(initial),
@@ -216,18 +213,26 @@ impl RemoteOps for ReconnectingRemote {
     }
 
     fn remove<'a>(&'a self, paths: &'a [String]) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move { od_op!(self, "remove", OP_TIMEOUT, |s| RemoteOps::remove(&**s, paths)) })
+        Box::pin(async move {
+            od_op!(self, "remove", OP_TIMEOUT, |s| RemoteOps::remove(
+                &**s, paths
+            ))
+        })
     }
 
     fn rename<'a>(&'a self, path: &'a str, new_name: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            od_op!(self, "rename", OP_TIMEOUT, |s| RemoteOps::rename(&**s, path, new_name))
+            od_op!(self, "rename", OP_TIMEOUT, |s| RemoteOps::rename(
+                &**s, path, new_name
+            ))
         })
     }
 
     fn download<'a>(&'a self, remote: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {
-            od_op!(self, "download", DOWNLOAD_TIMEOUT, |s| RemoteOps::download(&**s, remote))
+            od_op!(self, "download", DOWNLOAD_TIMEOUT, |s| RemoteOps::download(
+                &**s, remote
+            ))
         })
     }
 
@@ -269,18 +274,35 @@ impl RemoteOps for NasClient {
 
     fn remove<'a>(&'a self, paths: &'a [String]) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            within(OP_TIMEOUT, "remove", NasClient::remove(self, paths.to_vec())).await
+            within(
+                OP_TIMEOUT,
+                "remove",
+                NasClient::remove(self, paths.to_vec()),
+            )
+            .await
         })
     }
 
     fn rename<'a>(&'a self, path: &'a str, new_name: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            within(OP_TIMEOUT, "rename", NasClient::rename(self, path, new_name)).await
+            within(
+                OP_TIMEOUT,
+                "rename",
+                NasClient::rename(self, path, new_name),
+            )
+            .await
         })
     }
 
     fn download<'a>(&'a self, remote: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
-        Box::pin(async move { within(DOWNLOAD_TIMEOUT, "download", NasClient::download(self, remote)).await })
+        Box::pin(async move {
+            within(
+                DOWNLOAD_TIMEOUT,
+                "download",
+                NasClient::download(self, remote),
+            )
+            .await
+        })
     }
 
     fn download_to<'a>(
@@ -304,7 +326,12 @@ impl RemoteOps for NasClient {
         mtime: Option<i64>,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            within(UPLOAD_TIMEOUT, "upload", NasClient::upload(self, remote, data, mtime)).await
+            within(
+                UPLOAD_TIMEOUT,
+                "upload",
+                NasClient::upload(self, remote, data, mtime),
+            )
+            .await
         })
     }
 }
@@ -315,7 +342,8 @@ impl RemoteOps for NasClient {
 // 远端正常应在 1 秒内返回；给到 30 秒会让文件管理器在任何一次网络抖动里
 // 卡住半分钟，用户体感就是“卡死”。10 秒足以覆盖慢速网络与冷启动。
 const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+// HTTP body has a 30s idle timeout; allow large files on slow links to keep progressing.
+const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 async fn within<T>(
@@ -457,9 +485,7 @@ pub(crate) mod fake {
                 if !dir.is_empty() {
                     let nodes = self.nodes.read();
                     match nodes.get(&dir) {
-                        Some(n) if !n.dir => {
-                            return Err(anyhow::anyhow!("not a directory: {dir}"))
-                        }
+                        Some(n) if !n.dir => return Err(anyhow::anyhow!("not a directory: {dir}")),
                         None => return Err(anyhow::anyhow!("no such directory: {dir}")),
                         _ => {}
                     }
@@ -483,7 +509,10 @@ pub(crate) mod fake {
         }
 
         fn remove<'a>(&'a self, paths: &'a [String]) -> BoxFuture<'a, Result<()>> {
-            let paths: Vec<String> = paths.iter().map(|p| p.trim_matches('/').to_string()).collect();
+            let paths: Vec<String> = paths
+                .iter()
+                .map(|p| p.trim_matches('/').to_string())
+                .collect();
             Box::pin(async move {
                 let mut nodes = self.nodes.write();
                 let to_remove: Vec<String> = nodes

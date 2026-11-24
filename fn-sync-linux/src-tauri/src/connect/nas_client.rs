@@ -241,7 +241,8 @@ impl NasClient {
             conn_id: CONN_COUNTER.fetch_add(1, Ordering::Relaxed),
             http: reqwest::Client::builder()
                 .danger_accept_invalid_certs(!config.verify_tls)
-                .timeout(Duration::from_secs(300))
+                .connect_timeout(Duration::from_secs(15))
+                .read_timeout(Duration::from_secs(30))
                 .build()?,
             config,
             key: RwLock::new(Vec::new()),
