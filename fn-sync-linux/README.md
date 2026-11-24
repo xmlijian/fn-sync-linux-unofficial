@@ -87,3 +87,55 @@ FN_SYNC_UI_FIXTURES=/tmp/fn-ui-fixtures.json node scripts/qa-ui-smoke.cjs
 它会在临时目录验证实际导出内容。
 
 暂停任务会停止当前执行器并取消未完成传输；继续时重新创建执行器，从保存的基线重新核对文件。已提交给 NAS 的服务端操作可能完成收尾，不进行回滚。界面操作后立即刷新状态，并每秒更新任务列表。
+
+## 按需同步（open_cloud）
+
+官方客户端在 Windows 用内核 CfAPI（cldflt.sys + provider.exe）、macOS 用 FileProvider 实现
+“文件支持按需同步”；官方 Linux 明确不支持（界面文案 “Linux 暂不支持按需同步”）。
+本实现用 **FUSE3 用户态挂载**等价复刻该语义（`src-tauri/src/tasks/ondemand/`）：
+
+- 任务的 `pc_path` 即挂载点，目录实时映射 NAS 侧 `nas_path`（file.ls，1s TTL + 内核失效通知）
+- 文件仅占位元数据（大小/时间来自 NAS，不占磁盘）；首次 open/read 才下载（等价官方 DemandWriter）
+- 本地写入落缓存并异步上传（三步上传协议），flush 后由 worker 重试直至成功
+- 远端变化（6s 根目录差异轮询）实时反映；远端已变化而本地基于旧版本修改 → NAS 侧保留双方（Conflicted Copy）
+- 缓存 LRU 淘汰（默认上限 10 GiB，system_table `ondemand_cache_limit_bytes` 可覆盖），等价官方“释放电脑磁盘”
+- 崩溃/重启后未上传的修改自动补传（缓存目录 `.meta.json`）
+- 删除任务时清理缓存；存在未上传修改则保留并告警
+
+运行时依赖：内核 fuse 模块 + `fuse3` 包（deb 已声明依赖）。卸载发生在：任务暂停/停止/删除、
+切换 open_cloud、应用退出（RunEvent::Exit 兜底，不留死挂载点）。
+
+真机自检：
+
+```bash
+fn-sync-client --selftest-ondemand <host[:port]> <user> <password>
+# 期望输出 SELFTEST_ONDEMAND_OK
+```
+
+本地无 NAS 的端到端挂载测试（内存假后端 + 真实 FUSE）：
+
+```bash
+cd src-tauri && FN_SYNC_FUSE_TEST=1 cargo test --lib mount_read_write_delete_rename_roundtrip -- --ignored
+```
+
+前端 `official-ui/assets/index-*.js` 有最小补丁：仅放开 open_cloud 复选框的
+`type()=="linux"` 禁用条件与提示文案两处，其余界面逻辑未改动。
+
+## 排障记录（2026-11-21）
+
+### 全部任务“同步失败”且详情页空白
+
+两个独立问题叠加：
+
+1. **会话被作废后不自愈**：NAS 侧 token 失效（他处重新登录踢下线 / 过期）后，任务 actor 在
+   WebSocket 仍连接时不会重新鉴权，`file.ls` 持续报 `errno 4224`，每秒刷一条失败日志，
+   任务状态卡在 ERROR。实测 errno 语义：`135168`=token 过期、`4224`=会话被服务端作废、
+   `65534`=连接未鉴权。修复：`NasClient::rpc` 对这三类 errno 主动断开，actor 下一轮
+   `client()` 重连并走 `restore_session`（`user.tokenLogin` 用 long_token 刷新）。
+   恢复链路已用真实 NAS 验证：tokenLogin → authToken(新 token) → file.ls 全通。
+
+2. **详情页（同步日志）空白**：官方界面的日志筛选在未选择时提交 `null` 或 `""`
+   （taskId/status/actionCode/pageSize），后端严格 `i64` 反序列化拒绝整个请求
+   （`invalid type: string "", expected i64`），每秒轮询全部失败 → 页面无数据。
+   修复：`GetLogsParams` 的 action_code/status/task_id/page 统一走宽容解析
+   （`deserialize_optional_integer`），空串/null → None。

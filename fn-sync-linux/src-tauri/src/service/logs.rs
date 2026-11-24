@@ -46,13 +46,12 @@ pub struct GetLogsParams {
     pub end_time: Option<i64>,
     #[serde(default)]
     pub keyword: Option<String>,
-    #[serde(default)]
-    #[serde(alias = "actionCode")]
+    // 官方界面在未选择筛选时提交 null 或 ""，统一走宽容解析
+    #[serde(default, alias = "actionCode", deserialize_with = "deserialize_optional_integer")]
     pub action_code: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_integer")]
     pub status: Option<i64>,
-    #[serde(default)]
-    #[serde(alias = "taskId")]
+    #[serde(default, alias = "taskId", deserialize_with = "deserialize_optional_integer")]
     pub task_id: Option<i64>,
     #[serde(
         default = "default_page_size",
@@ -60,7 +59,7 @@ pub struct GetLogsParams {
     )]
     #[serde(alias = "pageSize")]
     pub page_size: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_page_size")]
     pub page: i64,
 }
 
@@ -269,6 +268,30 @@ mod tests {
         let p = open_db(&d.path().join("db.sqlite")).await.unwrap();
         migrate(&p).await.unwrap();
         (d, p)
+    }
+
+    // 官方界面在未选择筛选时提交 null / ""（taskId/status/actionCode/pageSize），
+    // 解析必须宽容，否则详情页每次轮询都报 invalid args，看起来就是“详情看不到东西”。
+    #[test]
+    fn ui_params_with_null_and_empty_strings() {
+        let raw = serde_json::json!({
+            "isDir": null, "keyword": "", "taskId": "", "status": null,
+            "actionCode": "", "pageSize": null, "startTime": "", "endTime": "", "page": 1
+        });
+        let p: GetLogsParams = serde_json::from_value(raw).expect("empty-string filters accepted");
+        assert_eq!(p.task_id, None);
+        assert_eq!(p.status, None);
+        assert_eq!(p.action_code, None);
+        assert_eq!(p.start_time, None);
+        assert_eq!(p.page_size, default_page_size());
+        assert_eq!(p.page, 1);
+
+        let raw2 = serde_json::json!({"taskId": 2, "status": 0, "actionCode": 5, "pageSize": 50});
+        let p2: GetLogsParams = serde_json::from_value(raw2).unwrap();
+        assert_eq!(p2.task_id, Some(2));
+        assert_eq!(p2.status, Some(0));
+        assert_eq!(p2.action_code, Some(5));
+        assert_eq!(p2.page_size, 50);
     }
 
     #[tokio::test]

@@ -113,7 +113,7 @@
   "unsupported_or_not_exercised": [
     "Linux on-demand placeholders are unsupported and disabled; ordinary sync is used",
     "system login/reboot and autostart launch not exercised",
-    "FN Connect relay/fnid not implemented; direct IP/hostname connections used",
+    "FN Connect relay/fnid resolves through the connect endpoint; P2P hole punching not implemented",
     "Kylin 2303/2403/3503, UOS1070 and ARM/LoongArch require native build/runtime validation",
     "LAN mDNS device discovery on target customer networks not exercised; IPC routing tested",
     "Checking/installing updates intentionally unsupported per user request; UI reports unsupported"

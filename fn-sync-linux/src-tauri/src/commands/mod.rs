@@ -192,7 +192,19 @@ pub async fn delete_task(state: State<'_, AppState>, id: i64) -> Result<(), Stri
     state.task_manager.lock().await.stop_task(id).await;
     tasks::delete_task(db(&state), id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // 按需同步缓存清理：存在未上传的本地修改时保留（避免丢数据），否则删除
+    if let Ok(cache_dir) = crate::platform::app_data_dir().map(|d| d.join("ondemand").join(id.to_string())) {
+        if cache_dir.exists() {
+            let meta = std::fs::read_to_string(cache_dir.join(".meta.json")).unwrap_or_default();
+            if meta.trim().is_empty() || meta.contains("\"dirty\":{}") {
+                let _ = std::fs::remove_dir_all(&cache_dir);
+            } else {
+                tracing::warn!(task_id = id, "on-demand cache kept: pending uploads exist");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -562,22 +574,27 @@ pub async fn get_traffic_query(state: State<'_, AppState>) -> Result<Value, Stri
     Ok(serde_json::json!({ "tx": tx, "rx": rx }))
 }
 
-/// ip 与 host 都是直连 NAS 的 5667 端口，语义相同。
-/// fnid 需要 FN Connect 中继（libtrimcon），当前版本未移植。
-fn ensure_direct_conn(conn_type: &str) -> Result<(), String> {
-    match conn_type {
-        "ip" | "host" | "" => Ok(()),
-        "fnid" => {
-            Err("fnid_not_supported: FN ID 连接需要 FN Connect 中继，请改用 IP 或域名连接".into())
-        }
+/// 校验连接方式取值。
+fn ensure_supported_conn(conn_type: &str) -> Result<(), String> {
+    match conn_type.trim() {
+        "ip" | "host" | "fnid" | "" => Ok(()),
         other => Err(format!("unsupported connection type: {other}")),
     }
+}
+
+/// 把连接地址解析为可直接建立连接的主机端口（fnid 走中继解析）。
+async fn resolve_conn_address(conn_type: &str, address: &str) -> Result<String, String> {
+    ensure_supported_conn(conn_type)?;
+    let target = crate::connect::address::resolve_target(address, conn_type)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(target.address)
 }
 
 // ---------- NAS 连接命令 ----------
 
 #[tauri::command]
-pub async fn connect_nas(state: State<'_, AppState>, config: Value) -> Result<i64, String> {
+pub async fn connect_nas(_state: State<'_, AppState>, config: Value) -> Result<i64, String> {
     let conn_type = config
         .get("conn_type")
         .and_then(|v| v.as_str())
@@ -586,24 +603,13 @@ pub async fn connect_nas(state: State<'_, AppState>, config: Value) -> Result<i6
         .get("address")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    ensure_direct_conn(conn_type)?;
-    check_trim_address_inner(&state, conn_type, address).await?;
+    check_trim_address_inner(conn_type, address).await?;
     // 校验通过后由前端走 OAuth 流程；此处返回占位账号 id
     Ok(-1)
 }
 
-async fn check_trim_address_inner(
-    state: &State<'_, AppState>,
-    conn_type: &str,
-    address: &str,
-) -> Result<(), String> {
-    let _ = state;
-    ensure_direct_conn(conn_type)?;
-    let addr = if address.contains(':') {
-        address.to_string()
-    } else {
-        format!("{address}:5667")
-    };
+async fn check_trim_address_inner(conn_type: &str, address: &str) -> Result<(), String> {
+    let addr = resolve_conn_address(conn_type, address).await?;
     tracing::info!(address = %addr, "check_trim_address probing NAS");
 
     // WS 握手 + getRSAPub/getHostName（与官方客户端一致的第一步）
@@ -622,11 +628,11 @@ async fn check_trim_address_inner(
 
 #[tauri::command]
 pub async fn check_trim_address(
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
     conn_type: String,
     address: String,
 ) -> Result<(), String> {
-    check_trim_address_inner(&state, &conn_type, &address).await
+    check_trim_address_inner(&conn_type, &address).await
 }
 
 #[tauri::command]
@@ -635,7 +641,9 @@ pub async fn query_nas_os_edition(
     address: String,
 ) -> Result<Value, String> {
     let _ = &state;
-    let (host, ver) = crate::connect::nas_client::NasClient::probe(&address)
+    let normalized = crate::connect::address::normalize(&address);
+    let addr = resolve_conn_address(&normalized.conn_type, &normalized.address).await?;
+    let (host, ver) = crate::connect::nas_client::NasClient::probe(&addr)
         .await
         .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "edition": ver, "hostName": host }))
@@ -647,12 +655,12 @@ pub async fn create_nas_client(
     conn_type: String,
     address: String,
 ) -> Result<u64, String> {
-    ensure_direct_conn(&conn_type)?;
+    let addr = resolve_conn_address(&conn_type, &address).await?;
     state
         .task_manager
         .lock()
         .await
-        .create_client(&address)
+        .create_client(&addr)
         .await
         .map_err(|e| e.to_string())
 }
@@ -703,13 +711,17 @@ pub async fn get_addr_type(
     conn_type: String,
     address: String,
 ) -> Result<String, String> {
-    let _ = (state, &conn_type);
-    if address.parse::<std::net::Ipv4Addr>().is_ok()
-        || address.contains(':') && !address.contains("fnos")
-    {
-        Ok("lan".into())
-    } else {
-        Ok("p2p".into())
+    let _ = &state;
+    match conn_type.trim() {
+        "fnid" => Ok("proxy".into()),
+        _ => {
+            let normalized = crate::connect::address::normalize(&address);
+            match normalized.conn_type.as_str() {
+                "fnid" => Ok("proxy".into()),
+                "ip" => Ok("lan".into()),
+                _ => Ok("host".into()),
+            }
+        }
     }
 }
 
@@ -830,18 +842,20 @@ pub async fn open_oauth_window(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     url: String,
-    _conn_type: String,
+    conn_type: String,
     account_id: Option<i64>,
 ) -> Result<(), String> {
     use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
     let _ = account_id;
 
-    let addr = url.trim().trim_end_matches('/').to_string();
-    let addr = if addr.contains(':') {
-        addr
+    // fnid 需先解析为中继地址。
+    let normalized = crate::connect::address::normalize(&url);
+    let kind = if conn_type.trim().is_empty() {
+        normalized.conn_type.clone()
     } else {
-        format!("{addr}:5667")
+        conn_type.trim().to_string()
     };
+    let addr = resolve_conn_address(&kind, &normalized.address).await?;
 
     // —— 与官方客户端一致：本机起 axum 代理，窗口加载 NAS 自己的 /login ——
     // NAS 前端检测到 Tauri 环境后会直接 invoke("put_auth_result", {data})，
@@ -874,8 +888,6 @@ pub async fn open_oauth_window(
     let win = builder
         .build()
         .map_err(|e| format!("oauth window build failed: {e}"))?;
-
-    win.open_devtools();
 
     // NAS 页面是 http://127.0.0.1（经代理），无自签证书问题。
     // 但页面内若加载 NAS 绝对地址的静态资源，仍需要 TLS 豁免。
@@ -974,14 +986,16 @@ pub async fn connect_nas_by_auth(state: State<'_, AppState>, config: Value) -> R
         .and_then(|v| v.as_str())
         .unwrap_or_default();
 
-    ensure_direct_conn(conn_type)?;
+    let normalized = crate::connect::address::normalize(address);
+    ensure_supported_conn(conn_type)?;
+    let resolved_address = resolve_conn_address(&normalized.conn_type, &normalized.address).await?;
 
     // 先尝试连通 + 拉取 NAS 信息
     let (nas_name, _fnos_version) = state
         .task_manager
         .lock()
         .await
-        .probe_nas(&address)
+        .probe_nas(&resolved_address)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -995,9 +1009,9 @@ pub async fn connect_nas_by_auth(state: State<'_, AppState>, config: Value) -> R
         nas_id,
         uid,
         nas_name,
-        address: address.to_string(),
+        address: normalized.address,
         username: username.to_string(),
-        conn_type: conn_type.to_string(),
+        conn_type: normalized.conn_type,
         secret_data: String::new(),
         long_token: long_token.to_string(),
         token: token.to_string(),
@@ -1021,11 +1035,8 @@ pub async fn login_nas(
     username: String,
     password: String,
 ) -> Result<i64, String> {
-    let addr = if address.contains(':') {
-        address.trim().to_string()
-    } else {
-        format!("{}:5667", address.trim())
-    };
+    let normalized = crate::connect::address::normalize(&address);
+    let addr = resolve_conn_address(&normalized.conn_type, &normalized.address).await?;
 
     let client = {
         let tm = state.task_manager.lock().await;
@@ -1041,10 +1052,13 @@ pub async fn login_nas(
     let token = client.token.read().clone();
     let machine_id = client.machine_id.read().clone();
 
-    let existing =
-        nas_account::get_nas_account_by_address_and_username(db(&state), &addr, &username)
-            .await
-            .map_err(|e| e.to_string())?;
+    let existing = nas_account::get_nas_account_by_address_and_username(
+        db(&state),
+        &normalized.address,
+        &username,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     if let Some(acc) = existing {
         nas_account::update_nas_account_password(db(&state), acc.id, &password)
@@ -1068,9 +1082,9 @@ pub async fn login_nas(
         } else {
             host
         },
-        address: addr,
+        address: normalized.address.clone(),
         username,
-        conn_type: "ip".into(),
+        conn_type: normalized.conn_type.clone(),
         secret_data: password,
         long_token: String::new(),
         token,
@@ -1519,9 +1533,18 @@ pub async fn edit_open_cloud(
     task_id: i64,
     open_cloud: bool,
 ) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
+    // 按需同步（Linux 用 FUSE3 挂载实现，语义对齐官方 Windows CfAPI/macOS FileProvider）。
+    // 官方前端约束：仅 bisynchronous（双向同步）可选 —— 已从 UI bundle 核实：
+    // 勾选按需后“仅上传/仅下载”单选被 disabled，选择这两个模式会强制 open_cloud=0。
+    // 后端同样拒绝该组合，避免非官方调用留下 (open_cloud=1, mode=uploadonly) 的非法状态。
     if open_cloud {
-        return Err("Linux 暂不支持按需同步，请使用普通同步".into());
+        let task = tasks::get_task_by_id(db(&state), task_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("task not found")?;
+        if task.mode != tasks::ON_DEMAND_MODE {
+            return Err("按需同步仅支持双向同步模式".into());
+        }
     }
     tasks::update_task(
         db(&state),
@@ -1704,17 +1727,13 @@ pub async fn send_message_from_temp_conn(
     reqid: Option<String>,
 ) -> Result<Value, String> {
     let _ = reqid;
-    ensure_direct_conn(&conn_type)?;
-    let address = if address.contains(':') {
-        address
-    } else {
-        format!("{address}:5667")
-    };
+    let normalized = crate::connect::address::normalize(&address);
+    ensure_supported_conn(&conn_type)?;
     let acc = nas_account::get_all_nas_accounts(db(&state))
         .await
         .map_err(|e| e.to_string())?
         .into_iter()
-        .find(|a| a.address == address)
+        .find(|a| a.address == normalized.address)
         .ok_or("no saved NAS account for this address")?;
     let client = state
         .task_manager

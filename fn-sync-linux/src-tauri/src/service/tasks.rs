@@ -144,6 +144,15 @@ impl FilterRuleInput {
 
 pub const VALID_MODES: &[&str] = &["bisynchronous", "uploadonly", "downloadonly"];
 
+/// 按需同步只能配合“双向同步”。
+///
+/// 官方前端的约束（已从 UI bundle 核实）：
+/// - 勾选按需同步后，“仅上传/仅下载”两个模式单选被 disabled；
+/// - 选择“仅上传/仅下载”会把 open_cloud 强制置 0。
+/// 后端必须自己再校验一次，否则会存在 (open_cloud=1, mode=uploadonly) 这种
+/// 非法组合，而挂载一旦建立就完全忽略 mode —— 表现为“仅上传”的任务却会下载。
+pub const ON_DEMAND_MODE: &str = "bisynchronous";
+
 pub fn validate_app_name(name: &str) -> Result<()> {
     if name.chars().count() > 32 {
         anyhow::bail!("task.appNameTooLong");
@@ -159,6 +168,12 @@ pub async fn add_task(pool: &SqlitePool, task: &TaskCreate) -> Result<i64> {
     if !VALID_MODES.contains(&task.mode.as_str()) {
         anyhow::bail!("unsupported sync mode: {}", task.mode);
     }
+    // 非双向模式下不允许按需同步，直接归一化为 0。
+    let open_cloud = if task.mode == ON_DEMAND_MODE {
+        task.open_cloud
+    } else {
+        0
+    };
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks")
         .fetch_one(pool)
         .await?;
@@ -193,7 +208,7 @@ pub async fn add_task(pool: &SqlitePool, task: &TaskCreate) -> Result<i64> {
     .bind(&task.pc_path)
     .bind(task.status)
     .bind(task.is_init_sync)
-    .bind(task.open_cloud)
+    .bind(open_cloud)
     .bind(now)
     .bind(now)
     .fetch_one(pool)
@@ -271,6 +286,21 @@ pub async fn update_task(pool: &SqlitePool, id: i64, upd: &TaskUpdate) -> Result
             anyhow::bail!("unsupported sync mode: {mode}");
         }
     }
+    // 取当前值以判断“最终”组合，避免只改其中一个字段就留下非法状态。
+    let current: Option<(String, i64)> =
+        sqlx::query_as("SELECT mode, open_cloud FROM tasks WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((cur_mode, cur_open_cloud)) = current else {
+        anyhow::bail!("task not found");
+    };
+    let final_mode = upd.mode.clone().unwrap_or(cur_mode);
+    let final_open_cloud = if final_mode == ON_DEMAND_MODE {
+        upd.open_cloud.unwrap_or(cur_open_cloud)
+    } else {
+        0
+    };
     if let Some(rule) = &upd.filter_rule {
         sqlx::query("UPDATE task_filter_rules SET ignore_dotfiles=?1, enable_ignore_ext=?2, ignore_extensions=?3, enable_size_lower=?4, size_lower_bound=?5, enable_size_upper=?6, size_upper_bound=?7, updated_at=?8 WHERE task_id=?9")
             .bind(rule.ignore_dotfiles).bind(rule.enable_ignore_ext).bind(rule.ignore_extensions.join(","))
@@ -278,12 +308,12 @@ pub async fn update_task(pool: &SqlitePool, id: i64, upd: &TaskUpdate) -> Result
             .bind(now_ms()).bind(id).execute(pool).await?;
     }
     sqlx::query(
-        "UPDATE tasks SET name = COALESCE(?1, name), mode = COALESCE(?2, mode), \
-         open_cloud = COALESCE(?3, open_cloud), updated_at = ?4 WHERE id = ?5",
+        "UPDATE tasks SET name = COALESCE(?1, name), mode = ?2, \
+         open_cloud = ?3, updated_at = ?4 WHERE id = ?5",
     )
     .bind(&upd.name)
-    .bind(&upd.mode)
-    .bind(upd.open_cloud)
+    .bind(&final_mode)
+    .bind(final_open_cloud)
     .bind(now_ms())
     .bind(id)
     .execute(pool)
@@ -468,11 +498,70 @@ mod tests {
         .unwrap();
         let t = get_task_by_id(&p, id).await.unwrap().unwrap();
         assert_eq!(t.mode, "uploadonly");
-        assert_eq!(t.open_cloud, 1);
+        // 仅上传模式不允许按需同步，后端必须归一化为 0。
+        assert_eq!(t.open_cloud, 0);
         update_task_status(&p, id, 4).await.unwrap();
         assert_eq!(get_task_by_id(&p, id).await.unwrap().unwrap().status, 4);
         delete_task(&p, id).await.unwrap();
         assert!(get_task_by_id(&p, id).await.unwrap().is_none());
+    }
+
+    /// 按需同步只允许与双向同步组合；其它模式必须被归一化为 0。
+    #[tokio::test]
+    async fn on_demand_requires_bisynchronous_mode() {
+        let (_d, p) = pool().await;
+
+        // 创建时就非法 → 归一化
+        let mut t = task("od-bad", "uploadonly");
+        t.open_cloud = 1;
+        let id = add_task(&p, &t).await.unwrap();
+        assert_eq!(get_task_by_id(&p, id).await.unwrap().unwrap().open_cloud, 0);
+
+        // 双向同步可以开
+        let id2 = add_task(&p, &task("od-ok", "bisynchronous")).await.unwrap();
+        update_task(
+            &p,
+            id2,
+            &TaskUpdate {
+                filter_rule: None,
+                name: None,
+                mode: None,
+                open_cloud: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(get_task_by_id(&p, id2).await.unwrap().unwrap().open_cloud, 1);
+
+        // 切到仅下载 → 必须自动关闭
+        update_task(
+            &p,
+            id2,
+            &TaskUpdate {
+                filter_rule: None,
+                name: None,
+                mode: Some("downloadonly".into()),
+                open_cloud: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(get_task_by_id(&p, id2).await.unwrap().unwrap().open_cloud, 0);
+
+        // 仅改 open_cloud 但当前不是双向同步 → 依然拒绝生效
+        update_task(
+            &p,
+            id2,
+            &TaskUpdate {
+                filter_rule: None,
+                name: None,
+                mode: None,
+                open_cloud: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(get_task_by_id(&p, id2).await.unwrap().unwrap().open_cloud, 0);
     }
 
     #[tokio::test]

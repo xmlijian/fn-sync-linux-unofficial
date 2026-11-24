@@ -4,6 +4,7 @@ pub mod commands;
 pub mod connect;
 pub mod platform;
 pub mod service;
+mod single_instance;
 pub mod task_manager;
 pub mod tasks;
 pub mod traffic;
@@ -35,10 +36,6 @@ impl AppState {
         let dir = platform::app_data_dir()?;
         let db = service::database::open_db(&dir.join("database.sqlite")).await?;
         service::database::migrate(&db).await?;
-        #[cfg(target_os = "linux")]
-        sqlx::query("UPDATE tasks SET open_cloud=0 WHERE open_cloud<>0")
-            .execute(&db)
-            .await?;
         for key in ["global_upload_speed_limit", "global_download_speed_limit"] {
             if let Some(value) = service::logs::get_system_value(&db, key).await? {
                 crate::traffic::set_limit(key, &value);
@@ -60,6 +57,14 @@ impl AppState {
 }
 
 pub fn run() {
+    if let Some(existing) = crate::single_instance::acquire() {
+        // 已有实例在运行：不要启动第二个。
+        //
+        // 两个实例会让按需同步互相踩踏——第二个抢挂载点失败（os error 17），
+        // 更糟的是它可能清理/重建共享缓存，导致第一个实例的文件状态全乱。
+        eprintln!("已有实例在运行（PID {existing}），本次启动退出。");
+        return;
+    }
     tauri::Builder::default()
         .plugin(crate::platform::mdns_plugin::init())
         .manage(crate::platform::mdns_plugin::MdnsPluginState::default())
@@ -71,6 +76,17 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .on_window_event(|window, event| {
+            // 官方前端语义：主窗口点“关闭”仅隐藏到托盘，应用继续常驻；
+            // 真正退出走托盘菜单“退出”或 app_quit 命令（均为 app.exit(0)）。
+            // 仅拦截 main 窗口；OAuth/selftest 等其它窗口保持原生关闭行为。
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
             // 官方客户端可接受 NAS 自签证书（WebView2: dangerousInsecureTransportProtocol；
             // macOS: 同等策略）。webkit2gtk 上等价做法是设置全局 TLS 错误策略为 Ignore。
@@ -259,8 +275,19 @@ pub fn run() {
             // mdns
             commands::mdns_discover_devices,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app_handle, event| {
+            // 进程退出前停掉所有任务：按需同步挂载点必须卸载，
+            // 否则留下死挂载点（后续访问报 Transport endpoint is not connected）。
+            if let tauri::RunEvent::Exit = event {
+                use tauri::Manager;
+                let state = app_handle.state::<AppState>();
+                let _ = tauri::async_runtime::block_on(async {
+                    state.task_manager.lock().await.stop_all().await;
+                });
+            }
+        });
 }
 
 fn setup_tray(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
@@ -272,6 +299,7 @@ fn setup_tray(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
     let menu = Menu::with_items(app, &[&show, &quit])?;
     let _tray = TrayIconBuilder::with_id("main-tray")
         .menu(&menu)
+        .icon(tauri::include_image!("icons/tray.png"))
         .tooltip("飞牛同步")
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => {
@@ -614,6 +642,354 @@ pub async fn selftest_sync(addr: &str, user: &str, pass: &str) -> i32 {
             "SELFTEST_SYNC_FAIL download not observed at {}",
             target.display()
         );
+        1
+    }
+}
+
+/// 诊断：验证按需同步（FUSE 挂载 + 真实 NAS）。
+/// 流程：登录 → 建目录/种子文件 → 挂载 → 读挂载点（按需下载）→ 写挂载点（异步上传）
+///       → 删除挂载点文件（删除传播）→ 卸载清理。
+/// 成功打印 SELFTEST_ONDEMAND_OK。
+pub async fn selftest_ondemand(addr: &str, user: &str, pass: &str) -> i32 {
+    use connect::nas_client::{NasClient, NasConnConfig};
+
+    let address = if addr.contains(':') {
+        addr.to_string()
+    } else {
+        format!("{addr}:5667")
+    };
+    let config = NasConnConfig {
+        address: address.clone(),
+        user: user.to_string(),
+        password: pass.to_string(),
+        device_name: "PcSync".into(),
+        verify_tls: false,
+    };
+
+    println!("[1/6] 登录 ...");
+    let nas = match NasClient::connect(config).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SELFTEST_ONDEMAND_FAIL login: {e}");
+            return 1;
+        }
+    };
+    println!("      uid={}", *nas.uid.read());
+    run_ondemand_scenario(nas).await
+}
+
+/// 诊断：用本地已保存的 NAS 会话（OAuth 凭据 / longToken）验证按需同步，
+/// 不需要用户密码。用于安装后验证。
+pub async fn selftest_ondemand_saved() -> i32 {
+    use service::nas_account::get_all_nas_accounts;
+    use task_manager::TaskManager;
+
+    let db = match service::database::open_db(
+        &platform::app_data_dir().unwrap().join("database.sqlite"),
+    )
+    .await
+    {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("SELFTEST_ONDEMAND_FAIL open db: {e}");
+            return 1;
+        }
+    };
+    let accounts = match get_all_nas_accounts(&db).await {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("SELFTEST_ONDEMAND_FAIL list accounts: {e}");
+            return 1;
+        }
+    };
+    let Some(acc) = accounts.into_iter().next() else {
+        eprintln!("SELFTEST_ONDEMAND_FAIL no saved NAS account; sign in once first");
+        return 1;
+    };
+    println!("[1/6] 用已保存会话连接 {} ({})", acc.nas_name, acc.address);
+    let nas = match TaskManager::new().account_client(&db, &acc).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SELFTEST_ONDEMAND_FAIL restore session: {e}");
+            return 1;
+        }
+    };
+    println!("      uid={}", *nas.uid.read());
+    run_ondemand_scenario(nas).await
+}
+
+/// 诊断：验证按需挂载在 **会话被服务端作废后能自动重连**（真实 NAS）。
+///
+/// 复现真实故障：挂载后另开一个同账号连接，把挂载自己的会话踢掉
+/// （fnOS 只保留最新会话），再读取一个尚未缓存的文件。
+/// 修复前这里会永久卡死；修复后应重建会话并成功读取。
+pub async fn selftest_ondemand_reconnect() -> i32 {
+    use service::nas_account::get_all_nas_accounts;
+    use std::sync::Arc;
+    use tasks::file_filter::FileFilter;
+    use tasks::ondemand::remote::{
+        ReconnectingRemote, RemoteOps, RemoteSession, SessionConnector,
+    };
+    use tasks::ondemand::{OnDemandConfig, OnDemandMount};
+
+    let db = match service::database::open_db(
+        &platform::app_data_dir().unwrap().join("database.sqlite"),
+    )
+    .await
+    {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("SELFTEST_RECONNECT_FAIL open db: {e}");
+            return 1;
+        }
+    };
+    let Some(acc) = get_all_nas_accounts(&db)
+        .await
+        .ok()
+        .and_then(|a| a.into_iter().next())
+    else {
+        eprintln!("SELFTEST_RECONNECT_FAIL no saved account");
+        return 1;
+    };
+
+    println!("[1/6] 建立初始会话 {} ({})", acc.nas_name, acc.address);
+    let first = match task_manager::open_account_client(&db, &acc).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SELFTEST_RECONNECT_FAIL connect: {e}");
+            return 1;
+        }
+    };
+
+    let db_c = db.clone();
+    let acc_c = acc.clone();
+    let connector: SessionConnector = Arc::new(move || {
+        let db = db_c.clone();
+        let acc = acc_c.clone();
+        Box::pin(async move {
+            let latest = crate::service::nas_account::get_nas_account_by_id(&db, acc.id)
+                .await?
+                .unwrap_or(acc);
+            let client = crate::task_manager::open_account_client(&db, &latest).await?;
+            let session: Arc<dyn RemoteSession> = client;
+            Ok(session)
+        })
+    });
+    let remote = ReconnectingRemote::new(Some(first as Arc<dyn RemoteSession>), connector);
+
+    let ts = chrono::Utc::now().timestamp();
+    let nas_dir = format!("vol2/1000/下载/fnsync-rc-{ts}");
+    let mount_dir = std::path::PathBuf::from(format!("/tmp/fnsync-rc-{ts}/mnt"));
+    let cache_root = std::path::PathBuf::from(format!("/tmp/fnsync-rc-{ts}/cache"));
+
+    println!("[2/6] 建远端目录与两个种子文件（第二个稍后才读）");
+    let a_bytes = b"before-invalidation".to_vec();
+    let b_bytes = b"after-invalidation".to_vec();
+    for (name, body) in [("a.txt", &a_bytes), ("b.txt", &b_bytes)] {
+        if let Err(e) = remote.upload(&format!("{nas_dir}/{name}"), body.to_vec(), None).await {
+            eprintln!("SELFTEST_RECONNECT_FAIL seed {name}: {e}");
+            let _ = remote.remove(&[nas_dir.clone()]).await;
+            return 1;
+        }
+    }
+
+    println!("[3/6] 挂载 {}", mount_dir.display());
+    std::fs::create_dir_all(&mount_dir).ok();
+    let cfg = OnDemandConfig {
+        task_id: 0,
+        task_name: format!("selftest-rc-{ts}"),
+        mountpoint: mount_dir.clone(),
+        nas_root: nas_dir.clone(),
+        cache_root,
+        cache_limit_bytes: tasks::ondemand::DEFAULT_CACHE_LIMIT_BYTES,
+    };
+    let ops: Arc<dyn RemoteOps> = remote.clone();
+    let db_for_mount = db.clone();
+    let mount = match tokio::task::spawn_blocking(move || {
+        OnDemandMount::start(
+            cfg,
+            ops,
+            db_for_mount,
+            FileFilter::from_db(None),
+        )
+    })
+    .await
+    {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => {
+            eprintln!("SELFTEST_RECONNECT_FAIL mount: {e}");
+            let _ = remote.remove(&[nas_dir.clone()]).await;
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("SELFTEST_RECONNECT_FAIL mount task: {e}");
+            return 1;
+        }
+    };
+
+    let mut ok = true;
+    println!("[4/6] 正常读取 a.txt（验证挂载可用）");
+    match std::fs::read(mount_dir.join("a.txt")) {
+        Ok(b) if b == a_bytes => println!("      a.txt 内容一致 ✓"),
+        other => {
+            eprintln!("SELFTEST_RECONNECT_FAIL read a: {other:?}");
+            ok = false;
+        }
+    }
+
+    println!("[5/6] 顶掉挂载会话（换新 token），再读 b.txt（必须自动重连）");
+    // 真实故障是这样发生的：他处（另一台设备/另一进程）重新认证后拿到新 token，
+    // 旧 token 立即失效，挂载持有的会话在下一次 RPC 收到 errno 4224 并自断。
+    // 这里用一个无效的旧 token 触发 `restore_session` 走 tokenLogin 换新 token，
+    // 从而让挂载手里的旧 token 失效。
+    let mut stale = acc.clone();
+    stale.token = "stale-token-for-reconnect-test".into();
+    match task_manager::open_account_client(&db, &stale).await {
+        Ok(_) => println!("      已顶掉旧 token（挂载会话应被作废）"),
+        Err(e) => println!("      顶替连接失败（仍继续验证）: {e}"),
+    }
+    let recovered = std::fs::read(mount_dir.join("b.txt"));
+    match recovered {
+        Ok(b) if b == b_bytes => println!("      b.txt 读取成功 ✓"),
+        other => {
+            eprintln!("SELFTEST_RECONNECT_FAIL read b after invalidation: {other:?}");
+            ok = false;
+        }
+    }
+    let reconnects = remote.reconnect_count();
+    println!("      重连次数 = {reconnects}");
+    if reconnects == 0 {
+        eprintln!("SELFTEST_RECONNECT_FAIL no reconnect happened");
+        ok = false;
+    }
+
+    println!("[6/6] 卸载 + 清理");
+    tokio::task::spawn_blocking(move || mount.stop()).await.ok();
+    let _ = remote.remove(&[nas_dir.clone()]).await;
+    let _ = std::fs::remove_dir_all(mount_dir.parent().unwrap());
+
+    if ok {
+        println!("SELFTEST_RECONNECT_OK 会话失效后可自动恢复");
+        0
+    } else {
+        1
+    }
+}
+
+/// 按需同步场景：建远端目录 → 挂载 → 按需下载 → 上传 → 删除传播 → 卸载。
+/// `nas` 必须是已认证的连接。
+async fn run_ondemand_scenario(nas: std::sync::Arc<connect::nas_client::NasClient>) -> i32 {
+    use std::sync::Arc;
+    use tasks::file_filter::FileFilter;
+    use tasks::ondemand::{OnDemandConfig, OnDemandMount};
+
+    let ts = chrono::Utc::now().timestamp();
+    let nas_dir = format!("vol2/1000/下载/fnsync-od-{ts}");
+    let mount_dir = std::path::PathBuf::from(format!("/tmp/fnsync-od-{ts}/mnt"));
+    let cache_root = std::path::PathBuf::from(format!("/tmp/fnsync-od-{ts}/cache"));
+
+    println!("[2/6] 建 NAS 目录 {nas_dir} + 种子文件");
+    if let Err(e) = nas.mkdir(&nas_dir).await {
+        eprintln!("SELFTEST_ONDEMAND_FAIL mkdir: {e}");
+        return 1;
+    }
+    let seed = format!("remote-seed-{ts}").into_bytes();
+    if let Err(e) = nas
+        .upload(&format!("{nas_dir}/seed.txt"), seed.clone(), None)
+        .await
+    {
+        eprintln!("SELFTEST_ONDEMAND_FAIL seed upload: {e}");
+        let _ = nas.remove(vec![nas_dir.clone()]).await;
+        return 1;
+    }
+
+    println!("[3/6] FUSE 挂载 {}", mount_dir.display());
+    std::fs::create_dir_all(&mount_dir).ok();
+    let cfg = OnDemandConfig {
+        task_id: 0,
+        task_name: format!("selftest-od-{ts}"),
+        mountpoint: mount_dir.clone(),
+        nas_root: nas_dir.clone(),
+        cache_root,
+        cache_limit_bytes: tasks::ondemand::DEFAULT_CACHE_LIMIT_BYTES,
+    };
+    let nas_for_mount: Arc<dyn tasks::ondemand::remote::RemoteOps> = nas.clone();
+    let mount = match tokio::task::spawn_blocking(move || {
+        OnDemandMount::start(
+            cfg,
+            nas_for_mount,
+            sqlx::SqlitePool::connect_lazy("sqlite::memory:")
+                .expect("memory db"),
+            FileFilter::from_db(None),
+        )
+    })
+    .await
+    {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => {
+            eprintln!("SELFTEST_ONDEMAND_FAIL mount: {e}");
+            let _ = nas.remove(vec![nas_dir.clone()]).await;
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("SELFTEST_ONDEMAND_FAIL mount task: {e}");
+            let _ = nas.remove(vec![nas_dir.clone()]).await;
+            return 1;
+        }
+    };
+
+    let mut ok = true;
+    println!("[4/6] 读挂载点（按需下载）...");
+    match std::fs::read(mount_dir.join("seed.txt")) {
+        Ok(bytes) if bytes == seed => println!("      内容一致 ✓"),
+        Ok(bytes) => {
+            eprintln!("SELFTEST_ONDEMAND_FAIL content mismatch: {bytes:?}");
+            ok = false;
+        }
+        Err(e) => {
+            eprintln!("SELFTEST_ONDEMAND_FAIL read: {e}");
+            ok = false;
+        }
+    }
+
+    println!("[5/6] 写挂载点 → 等待上传 → 删除传播 ...");
+    let written = b"written via on-demand mount";
+    if let Err(e) = std::fs::write(mount_dir.join("from-linux.txt"), written) {
+        eprintln!("SELFTEST_ONDEMAND_FAIL write: {e}");
+        ok = false;
+    }
+    let remote_check = format!("{nas_dir}/from-linux.txt");
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if nas.download(&remote_check).await.ok().as_deref() == Some(written.as_slice()) {
+            break;
+        }
+    }
+    if nas.download(&remote_check).await.ok().as_deref() != Some(written.as_slice()) {
+        eprintln!("SELFTEST_ONDEMAND_FAIL upload not observed");
+        ok = false;
+    }
+    let _ = std::fs::remove_file(mount_dir.join("from-linux.txt"));
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if !nas.ls(&nas_dir).await.unwrap_or_default().iter().any(|e| e.name == "from-linux.txt") {
+            break;
+        }
+    }
+    if nas.ls(&nas_dir).await.unwrap_or_default().iter().any(|e| e.name == "from-linux.txt") {
+        eprintln!("SELFTEST_ONDEMAND_FAIL delete not propagated");
+        ok = false;
+    }
+
+    println!("[6/6] 卸载 + 清理 ...");
+    tokio::task::spawn_blocking(move || mount.stop()).await.ok();
+    let _ = nas.remove(vec![nas_dir.clone()]).await;
+    let _ = std::fs::remove_dir_all(mount_dir.parent().unwrap());
+
+    if ok {
+        println!("SELFTEST_ONDEMAND_OK 按需同步验证通过");
+        0
+    } else {
         1
     }
 }

@@ -60,6 +60,8 @@ open = "5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = { version = "2", features = ["v2_40"] }
+# 按需同步：FUSE3 用户态挂载（纯 Rust 实现，无需 libfuse；运行时依赖系统 fusermount3）
+fuser = { version = "0.15", features = ["abi-7-11", "abi-7-12"] }
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
@@ -78,12 +80,13 @@ strip = true
 [package.metadata.deb]
 maintainer = "fn-sync linux port"
 copyright = "Use of this software is for interoperability research"
-depends = "$auto, libwebkit2gtk-4.1-0, libgtk-3-0"
+depends = "$auto, libwebkit2gtk-4.1-0, libgtk-3-0, libayatana-appindicator3-1, fuse3"
 section = "utils"
 priority = "optional"
 extended-description = """\
 飞牛同步 (FN Sync) Linux 客户端 — 与 fnOS NAS 同步服务互通的文件同步工具。
 逆向实现自官方 0.2.3 Windows/macOS 客户端。
+支持按需同步（open_cloud）：FUSE3 挂载，文件仅占位元数据，打开时才下载，缓存 LRU 淘汰释放磁盘。
 """
 assets = [
     ["target/release/fn-sync-client", "usr/bin/fn-sync-client", "755"],

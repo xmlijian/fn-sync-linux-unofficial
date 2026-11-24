@@ -217,27 +217,41 @@ impl TaskActor {
         Ok(())
     }
 
+    /// 每一轮同步只把状态置一次 SYNCING，避免空轮询时界面在同步中/已完成之间跳动。
+    async fn note_work(&self, started: &mut bool) {
+        if *started {
+            return;
+        }
+        *started = true;
+        let _ =
+            crate::service::tasks::update_task_status(&self.db_pool, self.task.id, status::SYNCING)
+                .await;
+    }
+
     async fn reconcile(&self) -> Result<()> {
         if *self.paused.lock() {
             return Ok(());
         }
-        let _ =
-            crate::service::tasks::update_task_status(&self.db_pool, self.task.id, status::SYNCING)
-                .await;
+        let mut started = false;
         if self.mode.allows_download() {
-            self.poll_remote().await?;
+            self.poll_remote(&mut started).await?;
         }
         if self.mode.allows_upload() {
-            self.sync_local().await?;
+            self.sync_local(&mut started).await?;
         }
         self.save_snapshot().await?;
         if !*self.paused.lock() {
-            let _ = crate::service::tasks::update_task_status(
-                &self.db_pool,
-                self.task.id,
-                status::COMPLETED,
-            )
-            .await;
+            let settled = crate::service::tasks::get_task_by_id(&self.db_pool, self.task.id)
+                .await?
+                .map(|t| t.status);
+            if started || settled != Some(status::COMPLETED) {
+                let _ = crate::service::tasks::update_task_status(
+                    &self.db_pool,
+                    self.task.id,
+                    status::COMPLETED,
+                )
+                .await;
+            }
         }
         Ok(())
     }
@@ -263,7 +277,7 @@ impl TaskActor {
         Ok((meta.len(), mt, changed))
     }
 
-    async fn sync_local(&self) -> Result<()> {
+    async fn sync_local(&self, started: &mut bool) -> Result<()> {
         let paths = self.initial_sync_scan().await?;
         let previous = self.local_state.lock().clone();
         let mut now = HashMap::new();
@@ -276,6 +290,7 @@ impl TaskActor {
             let missing_directory = local.is_dir() && !self.remote_state.lock().contains_key(&rel);
             if previous.get(&rel) != Some(&stamp) || missing_directory {
                 let is_dir = local.is_dir();
+                self.note_work(started).await;
                 self.handle_local(LocalFileChange {
                     event_type: "Modify".into(),
                     relative_path: rel.clone(),
@@ -300,6 +315,7 @@ impl TaskActor {
             }
             let tracked = self.remote_state.lock().contains_key(&rel);
             if tracked {
+                self.note_work(started).await;
                 self.handle_local(LocalFileChange {
                     event_type: "Remove".into(),
                     relative_path: rel.clone(),
@@ -427,7 +443,7 @@ impl TaskActor {
     }
 
     /// 拉取远端目录树，下载新增/变更，清理远端已删除且本地未改动的文件。
-    async fn poll_remote(&self) -> Result<()> {
+    async fn poll_remote(&self, started: &mut bool) -> Result<()> {
         let root = self.nas_root();
         let nas = self.client().await?;
         let tree = nas.remote_tree_filtered(&root, Some(&self.filter)).await?;
@@ -500,6 +516,7 @@ impl TaskActor {
                 || remote_changed
                 || (self.mode == SyncMode::DownOnly && local_changed);
             if need {
+                self.note_work(started).await;
                 let remote = format!("{root}/{rel}");
                 let result = if let Some(bytes) = downloaded {
                     Ok(bytes)
@@ -557,40 +574,46 @@ impl TaskActor {
         }
 
         // 远端已删除 → 删除本地（仅当本地未被改动）
-        let mut prev = self.remote_state.lock();
-        let mut removed: Vec<String> = prev
-            .keys()
-            .filter(|k| !now.contains_key(*k))
-            .cloned()
-            .collect();
-        removed.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
-        for rel in removed.into_iter().filter(|_| self.mode == SyncMode::Bi) {
-            let local = self.safe_local_path(&rel)?;
-            let prior_size = if local.is_dir() {
-                None
-            } else {
-                prev.get(&rel).map(|(size, _)| *size)
-            };
-            if !self.filter.should_sync(&rel, prior_size) {
-                continue;
-            }
-            if let Some((size, _)) = prev.get(&rel) {
-                let _ = size;
-                let same =
-                    Self::local_stamp(&local).ok().as_ref() == self.local_state.lock().get(&rel);
-                if same {
-                    if local.is_dir() {
-                        let _ = std::fs::remove_dir(&local);
-                    } else {
-                        let _ = std::fs::remove_file(&local);
+        let mut deleted_any = false;
+        {
+            let mut prev = self.remote_state.lock();
+            let mut removed: Vec<String> = prev
+                .keys()
+                .filter(|k| !now.contains_key(*k))
+                .cloned()
+                .collect();
+            removed.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
+            for rel in removed.into_iter().filter(|_| self.mode == SyncMode::Bi) {
+                let local = self.safe_local_path(&rel)?;
+                let prior_size = if local.is_dir() {
+                    None
+                } else {
+                    prev.get(&rel).map(|(size, _)| *size)
+                };
+                if !self.filter.should_sync(&rel, prior_size) {
+                    continue;
+                }
+                if let Some((size, _)) = prev.get(&rel) {
+                    let _ = size;
+                    let same = Self::local_stamp(&local).ok().as_ref()
+                        == self.local_state.lock().get(&rel);
+                    if same {
+                        if local.is_dir() {
+                            let _ = std::fs::remove_dir(&local);
+                        } else {
+                            let _ = std::fs::remove_file(&local);
+                        }
+                        deleted_any = true;
+                        self.local_state.lock().remove(&rel);
                     }
-                    self.local_state.lock().remove(&rel);
                 }
             }
+            *prev = now;
         }
-        *prev = now;
-        drop(prev);
         *self.remote_revisions.lock() = revisions;
+        if deleted_any {
+            self.note_work(started).await;
+        }
         Ok(())
     }
 

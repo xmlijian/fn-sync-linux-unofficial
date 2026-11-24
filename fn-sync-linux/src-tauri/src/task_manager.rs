@@ -1,4 +1,4 @@
-//! 任务管理器 — NAS 客户端连接池 + 任务 actor 生命周期。
+//! 任务管理器 — NAS 客户端连接池 + 任务 actor / 按需同步挂载生命周期。
 
 use crate::service::nas_account::NasAccount;
 use crate::traffic::TrafficCounter;
@@ -14,10 +14,40 @@ struct RunningTask {
     account_id: i64,
 }
 
+/// 运行中的任务：普通同步 actor，或按需同步 FUSE 挂载（open_cloud=1）。
+enum RunningKind {
+    Sync(RunningTask),
+    OnDemand {
+        mount: crate::tasks::ondemand::OnDemandMount,
+        account_id: i64,
+    },
+}
+
+impl RunningKind {
+    fn account_id(&self) -> i64 {
+        match self {
+            Self::Sync(t) => t.account_id,
+            Self::OnDemand { account_id, .. } => *account_id,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        match self {
+            Self::Sync(t) => !t.abort.is_finished(),
+            Self::OnDemand { .. } => true,
+        }
+    }
+}
+
 pub struct TaskManager {
     clients: DashMap<u64, Arc<crate::connect::nas_client::NasClient>>,
-    account_clients: DashMap<i64, Arc<crate::connect::nas_client::NasClient>>,
-    running: DashMap<i64, RunningTask>,
+    /// 按账号共享的会话缓存。**同一进程内每个账号只允许一个会话**：
+    /// fnOS 的 tokenLogin 会作废旧 token，若按需挂载与普通同步各建一个，
+    /// 两边会互相把对方顶下线，形成无限互踢。
+    account_clients: Arc<DashMap<i64, Arc<crate::connect::nas_client::NasClient>>>,
+    /// 按账号的建连闸门：并发请求只让一个真正建连。
+    account_locks: Arc<DashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+    running: DashMap<i64, RunningKind>,
     traffic: TrafficCounter,
 }
 
@@ -35,11 +65,95 @@ fn conn_config(
     }
 }
 
+/// 用账号信息建立并认证一个 NAS 连接（不需要密码，走保存的会话）。
+/// fnid 账号每次建连都重新解析中继地址。
+///
+/// 整体限时：`connect_async` 本身没有超时，网络/代理卡住时会让调用方
+/// 无限期挂起（按需挂载因此整棵树卡死）。
+pub async fn open_account_client(
+    db: &sqlx::SqlitePool,
+    acc: &NasAccount,
+) -> Result<Arc<crate::connect::nas_client::NasClient>> {
+    let attempt = async {
+        let address = crate::connect::address::resolve_target(&acc.address, &acc.conn_type)
+            .await?
+            .address;
+        let client =
+            crate::connect::nas_client::NasClient::open(conn_config(&address, "", "")).await?;
+        client.restore_session(acc).await?;
+        client.persist_access_token(db, acc).await?;
+        Ok::<_, anyhow::Error>(client)
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(25), attempt).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow!("NAS connect/auth timed out")),
+    }
+}
+
+/// 按账号取一个**共享**的已认证会话：活着就复用，死了才重建（单飞）。
+/// 保证同一进程内同一账号只有一个会话，避免 tokenLogin 互踢。
+async fn shared_account_client(
+    clients: &Arc<DashMap<i64, Arc<crate::connect::nas_client::NasClient>>>,
+    locks: &Arc<DashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+    db: &sqlx::SqlitePool,
+    acc: &NasAccount,
+) -> Result<Arc<crate::connect::nas_client::NasClient>> {
+    if let Some(client) = clients.get(&acc.id) {
+        if client.is_connected() {
+            return Ok(client.clone());
+        }
+    }
+    let lock = locks
+        .entry(acc.id)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _guard = match tokio::time::timeout(std::time::Duration::from_secs(30), lock.lock()).await {
+        Ok(g) => g,
+        Err(_) => return Err(anyhow!("timed out waiting for NAS connect gate")),
+    };
+    // 双检：排队期间可能已被别人建好。
+    if let Some(client) = clients.get(&acc.id) {
+        if client.is_connected() {
+            return Ok(client.clone());
+        }
+    }
+    clients.remove(&acc.id);
+    let client = open_account_client(db, acc).await?;
+    clients.insert(acc.id, client.clone());
+    Ok(client)
+}
+
+/// 按需挂载的重连工厂：复用按账号共享的会话（与普通同步同一个），
+/// 这样不会因为重复 tokenLogin 把对方顶下线。
+fn ondemand_connector(
+    clients: Arc<DashMap<i64, Arc<crate::connect::nas_client::NasClient>>>,
+    locks: Arc<DashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+    db: sqlx::SqlitePool,
+    acc: NasAccount,
+) -> crate::tasks::ondemand::remote::SessionConnector {
+    use crate::tasks::ondemand::remote::RemoteSession;
+    Arc::new(move || {
+        let clients = clients.clone();
+        let locks = locks.clone();
+        let db = db.clone();
+        let acc = acc.clone();
+        Box::pin(async move {
+            let latest = crate::service::nas_account::get_nas_account_by_id(&db, acc.id)
+                .await?
+                .unwrap_or(acc);
+            let client = shared_account_client(&clients, &locks, &db, &latest).await?;
+            let session: Arc<dyn RemoteSession> = client;
+            Ok(session)
+        })
+    })
+}
+
 impl TaskManager {
     pub fn new() -> Self {
         Self {
             clients: DashMap::new(),
-            account_clients: DashMap::new(),
+            account_clients: Arc::new(DashMap::new()),
+            account_locks: Arc::new(DashMap::new()),
             running: DashMap::new(),
             traffic: TrafficCounter::new(),
         }
@@ -77,18 +191,7 @@ impl TaskManager {
         db: &sqlx::SqlitePool,
         acc: &NasAccount,
     ) -> Result<Arc<crate::connect::nas_client::NasClient>> {
-        if let Some(client) = self.account_clients.get(&acc.id) {
-            if client.is_connected() {
-                return Ok(client.clone());
-            }
-        }
-        self.account_clients.remove(&acc.id);
-        let client =
-            crate::connect::nas_client::NasClient::open(conn_config(&acc.address, "", "")).await?;
-        client.restore_session(acc).await?;
-        client.persist_access_token(db, acc).await?;
-        self.account_clients.insert(acc.id, client.clone());
-        Ok(client)
+        shared_account_client(&self.account_clients, &self.account_locks, db, acc).await
     }
 
     pub fn delete_client(&self, conn_id: u64) {
@@ -129,7 +232,7 @@ impl TaskManager {
         Ok((name, ver))
     }
 
-    /// 启动同步任务。
+    /// 启动同步任务（open_cloud=1 时启动按需同步 FUSE 挂载）。
     pub async fn start_task(
         &self,
         db: &sqlx::SqlitePool,
@@ -139,7 +242,7 @@ impl TaskManager {
         if self
             .running
             .get(&task_id)
-            .map(|r| !r.abort.is_finished())
+            .map(|r| r.is_active())
             .unwrap_or(false)
         {
             return Ok(());
@@ -154,6 +257,29 @@ impl TaskManager {
             .with_excluded_paths(excluded);
 
         let nas = self.account_client(db, acc).await?;
+
+        // 兜底：按需同步只对“双向同步”有意义。若数据库里残留非法组合
+        // （如外部直接改库），归一化为普通同步，避免“仅上传”的任务反而开始下载。
+        if task.open_cloud == 1 && task.mode != crate::service::tasks::ON_DEMAND_MODE {
+            tracing::warn!(
+                task_id,
+                mode = %task.mode,
+                "on-demand sync requires bisynchronous mode; falling back to regular sync"
+            );
+            let _ = crate::service::tasks::update_task(
+                db,
+                task_id,
+                &crate::service::tasks::TaskUpdate {
+                    filter_rule: None,
+                    name: None,
+                    mode: None,
+                    open_cloud: Some(0),
+                },
+            )
+            .await;
+        } else if task.open_cloud == 1 {
+            return self.start_ondemand(db, task, acc, nas, filter).await;
+        }
 
         let (local_tx, local_rx) = mpsc::channel(4096);
 
@@ -200,20 +326,104 @@ impl TaskManager {
         });
         self.running.insert(
             task_id,
-            RunningTask {
+            RunningKind::Sync(RunningTask {
                 actor,
                 abort: handle.abort_handle(),
                 join: handle,
                 account_id: acc.id,
-            },
+            }),
         );
         Ok(())
     }
 
+    /// 启动按需同步：pc_path 即挂载点，目录实时映射 NAS 内容。
+    async fn start_ondemand(
+        &self,
+        db: &sqlx::SqlitePool,
+        task: crate::service::tasks::Task,
+        acc: &NasAccount,
+        nas: Arc<crate::connect::nas_client::NasClient>,
+        filter: crate::tasks::file_filter::FileFilter,
+    ) -> Result<()> {
+        let cache_root = crate::platform::app_data_dir()?
+            .join("ondemand")
+            .join(task.id.to_string());
+        let cfg = crate::tasks::ondemand::OnDemandConfig {
+            task_id: task.id,
+            task_name: task.name.clone(),
+            mountpoint: std::path::PathBuf::from(&task.pc_path),
+            nas_root: task.nas_path.trim_matches('/').to_string(),
+            cache_root,
+            cache_limit_bytes: crate::tasks::ondemand::cache_limit_from_settings(db).await,
+        };
+        let task_id = task.id;
+        let db_owned = db.clone();
+        // 按需挂载必须自己负责重连：会话被服务端作废（errno 4224 等）时
+        // NasClient 会自断，而挂载没有 TaskActor 替它重连。用 ReconnectingRemote
+        // 包一层，重连走与普通同步相同的 restore_session（longToken，无需密码）。
+        let connector = ondemand_connector(
+            self.account_clients.clone(),
+            self.account_locks.clone(),
+            db.clone(),
+            acc.clone(),
+        );
+        let nas: Arc<dyn crate::tasks::ondemand::remote::RemoteSession> = nas;
+        let remote = crate::tasks::ondemand::remote::ReconnectingRemote::new(Some(nas), connector);
+        let remote: Arc<dyn crate::tasks::ondemand::remote::RemoteOps> = remote;
+        let mount = tokio::task::spawn_blocking(move || {
+            crate::tasks::ondemand::OnDemandMount::start(cfg, remote, db_owned, filter)
+        })
+        .await
+        .map_err(|e| anyhow!("on-demand mount task failed: {e}"))?;
+        let mount = match mount {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = crate::service::tasks::update_task_status(
+                    db,
+                    task_id,
+                    crate::tasks::actor::status::FAILED,
+                )
+                .await;
+                return Err(e);
+            }
+        };
+        crate::service::tasks::update_task_status(
+            db,
+            task_id,
+            crate::tasks::actor::status::COMPLETED,
+        )
+        .await?;
+        self.running.insert(
+            task_id,
+            RunningKind::OnDemand {
+                mount,
+                account_id: acc.id,
+            },
+        );
+        tracing::info!(task_id, "on-demand task started");
+        Ok(())
+    }
+
     pub async fn stop_task(&self, task_id: i64) {
-        if let Some((_, r)) = self.running.remove(&task_id) {
-            r.abort.abort();
-            let _ = r.join.await;
+        if let Some((_, kind)) = self.running.remove(&task_id) {
+            match kind {
+                RunningKind::Sync(r) => {
+                    r.abort.abort();
+                    let _ = r.join.await;
+                }
+                RunningKind::OnDemand { mount, .. } => {
+                    // 卸载可能阻塞到派发线程退出；放到阻塞线程池
+                    let _ = tokio::task::spawn_blocking(move || mount.stop()).await;
+                }
+            }
+        }
+    }
+
+    /// 停止全部任务（进程退出时卸载所有按需挂载点）。
+    pub async fn stop_all(&self) {
+        let ids: Vec<i64> = self.running.iter().map(|e| *e.key()).collect();
+        for id in ids {
+            self.stop_task(id).await;
         }
     }
 
@@ -261,21 +471,21 @@ impl TaskManager {
     pub fn is_running(&self, task_id: i64) -> bool {
         self.running
             .get(&task_id)
-            .map(|r| !r.abort.is_finished())
+            .map(|r| r.is_active())
             .unwrap_or(false)
     }
 
     pub fn task_count(&self) -> usize {
-        self.running
-            .iter()
-            .filter(|r| !r.abort.is_finished())
-            .count()
+        self.running.iter().filter(|r| r.is_active()).count()
     }
 
     pub fn running_count(&self) -> usize {
         self.running
             .iter()
-            .filter(|r| !r.abort.is_finished() && !r.actor.is_paused())
+            .filter(|r| match r.value() {
+                RunningKind::Sync(t) => !t.abort.is_finished() && !t.actor.is_paused(),
+                RunningKind::OnDemand { .. } => true,
+            })
             .count()
     }
 
@@ -286,7 +496,7 @@ impl TaskManager {
         let ids: Vec<i64> = self
             .running
             .iter()
-            .filter(|e| e.account_id == acc_id)
+            .filter(|e| e.value().account_id() == acc_id)
             .map(|e| *e.key())
             .collect();
         for id in ids {
@@ -298,7 +508,9 @@ impl TaskManager {
 impl Drop for TaskManager {
     fn drop(&mut self) {
         for task in self.running.iter() {
-            task.abort.abort();
+            if let RunningKind::Sync(t) = task.value() {
+                t.abort.abort();
+            }
         }
     }
 }

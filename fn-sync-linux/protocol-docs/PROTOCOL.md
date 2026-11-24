@@ -14,7 +14,8 @@
 | `https://appversion.fnnas.com/api/v1/check-update/com.fn-sync-client/{target}/{arch}/{current_version}` | 更新检查 |
 | `https://event.fnnas.com/api/v1/fe` | 遥测事件上报 |
 
-连接类型：`ip`（IP:port 直连）或 `fnid`（FN Connect 中继，走 libtrimcon Go 隧道 — 第一版不实现）。
+连接类型：`ip`（IP:port 直连）、`host`（域名直连）或 `fnid`（FN Connect 中继）。
+`fnid` 由后端请求 FN Connect 解析端点得到中继地址（`<id>.fnos.net:443`），后续 HTTP/WS 直连该地址。
 
 ## 2. 登录 / OAuth
 

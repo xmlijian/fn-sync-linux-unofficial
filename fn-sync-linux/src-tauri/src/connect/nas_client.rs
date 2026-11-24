@@ -219,6 +219,18 @@ impl NasClient {
                         continue;
                     }
                 }
+                // 实测 NAS 对 user.login（encrypted）的成功回包不回显 reqid。
+                // 兜底：只有一个在途请求时交付给它（与官方参考客户端“读到非 pong
+                // 帧即视为响应”的语义一致）；串行 RPC 场景不会歧义。
+                if pending_r.len() == 1 {
+                    let entry = pending_r.iter().next().map(|e| (e.key().clone()));
+                    if let Some(id) = entry {
+                        if let Some((_, s)) = pending_r.remove(&id) {
+                            let _ = s.send(v);
+                            continue;
+                        }
+                    }
+                }
                 // 服务端推送不能作为任何一个 RPC 的响应。
             }
             connected_r.store(false, Ordering::Relaxed);
@@ -309,14 +321,21 @@ impl NasClient {
         let reply = self
             .send_wait(&rid, format!("{sig}{js}"), Duration::from_secs(30))
             .await?;
-        if reply.get("errno").and_then(|v| v.as_i64()) == Some(135168)
+        // 会话失效的三类 errno（实测）：
+        //   135168 = token 过期；4224 = 会话被服务端作废（如他处重新登录踢下线）；
+        //   65534 = 连接未鉴权。
+        // 断开连接 → 任务 actor 的 client() 会重连并走 restore_session（tokenLogin 刷新），
+        // 避免出现“WS 还在但会话已死”的每秒失败循环。
+        let errno = reply.get("errno").and_then(|v| v.as_i64()).unwrap_or(0);
+        if matches!(errno, 135168 | 4224 | 65534)
             && !matches!(
                 req.get("req").and_then(|v| v.as_str()),
                 Some("user.authToken" | "user.tokenLogin")
             )
         {
+            tracing::warn!(errno, req = %req.get("req").and_then(|v| v.as_str()).unwrap_or(""), "NAS session rejected; reconnecting to restore");
             self.disconnect();
-            return Err(anyhow!("NAS session expired"));
+            return Err(anyhow!("NAS session expired (errno {errno})"));
         }
         Ok(reply)
     }
@@ -610,6 +629,54 @@ impl NasClient {
         }
         crate::traffic::TrafficCounter::new().add(0, bytes.len() as i64);
         Ok(bytes)
+    }
+
+    /// 流式下载到指定文件，边下边写，不把整个文件读进内存。
+    ///
+    /// `on_progress` 在每收到一个数据块后调用（参数为累计字节数），
+    /// 用于实时进度显示。返回写入的总字节数。
+    ///
+    /// 这样几百 MB 甚至数 GB 的文件也不会一次性占用等量内存。
+    pub async fn download_to<F>(
+        &self,
+        remote: &str,
+        dest: &std::path::Path,
+        on_progress: F,
+    ) -> Result<u64>
+    where
+        F: Fn(u64) + Send + Sync,
+    {
+        let r = self
+            .rpc(json!({ "req": "file.download", "files": [remote] }))
+            .await?;
+        let uri = r
+            .get("download")
+            .and_then(|d| d.get(0))
+            .and_then(|d| d.get("uri"))
+            .and_then(|u| u.as_str())
+            .ok_or_else(|| anyhow!("download: {r}"))?;
+        let url = format!("https://{}{}", self.config.host(), uri);
+        let resp = self.http.get(&url).send().await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("download http {}", resp.status()));
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = tokio::fs::File::create(dest).await?;
+        let mut stream = resp.bytes_stream();
+        let mut written: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            crate::traffic::throttle(chunk.len(), false).await;
+            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+            written += chunk.len() as u64;
+            on_progress(written);
+        }
+        tokio::io::AsyncWriteExt::flush(&mut file).await?;
+        drop(file);
+        crate::traffic::TrafficCounter::new().add(0, written as i64);
+        Ok(written)
     }
 
     // ---------------- 上传 ----------------
