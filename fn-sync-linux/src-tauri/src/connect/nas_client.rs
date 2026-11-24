@@ -632,6 +632,33 @@ impl NasClient {
         Ok(bytes)
     }
 
+    /// HTTP Range is validated before reading the body. Never fall back to a full ISO download.
+    pub async fn read_range(&self, remote: &str, offset: u64, size: usize) -> Result<Vec<u8>> {
+        if size == 0 || size > 1024 * 1024 {
+            return Err(anyhow!("invalid range size"));
+        }
+        let end = offset
+            .checked_add(size as u64 - 1)
+            .ok_or_else(|| anyhow!("range overflow"))?;
+        let r = self
+            .rpc(json!({"req":"file.download", "files":[remote]}))
+            .await?;
+        let uri = r
+            .get("download")
+            .and_then(|d| d.get(0))
+            .and_then(|d| d.get("uri"))
+            .and_then(|u| u.as_str())
+            .ok_or_else(|| anyhow!("download uri missing"))?;
+        let response = self
+            .http
+            .get(format!("https://{}{}", self.config.host(), uri))
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
+            .send()
+            .await?;
+        read_range_body(response, offset, size).await
+    }
+
     /// 流式下载到指定文件，边下边写，不把整个文件读进内存。
     ///
     /// `on_progress` 在每收到一个数据块后调用（参数为累计字节数），
@@ -859,6 +886,52 @@ pub fn skip_verify_config() -> Result<rustls::ClientConfig> {
     Ok(cfg)
 }
 
+async fn read_range_body(response: reqwest::Response, offset: u64, size: usize) -> Result<Vec<u8>> {
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(anyhow!(
+            "NAS 未支持分段读取（HTTP {}），请使用下载到本地",
+            response.status()
+        ));
+    }
+    let header = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|h| h.to_str().ok())
+        .ok_or_else(|| anyhow!("NAS Range response missing Content-Range"))?;
+    let range = header
+        .strip_prefix("bytes ")
+        .and_then(|s| s.split_once('/'))
+        .and_then(|(r, total)| r.split_once('-').map(|(a, b)| (a, b, total)))
+        .ok_or_else(|| anyhow!("invalid Content-Range"))?;
+    let start: u64 = range.0.parse()?;
+    let end: u64 = range.1.parse()?;
+    let total: u64 = range.2.parse()?;
+    if start != offset || end < start || end >= total || end - start + 1 > size as u64 {
+        return Err(anyhow!(
+            "NAS Range response does not match requested interval"
+        ));
+    }
+    let expected = (end - start + 1) as usize;
+    let mut body = Vec::with_capacity(expected);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if chunk.len() > expected.saturating_sub(body.len()) {
+            return Err(anyhow!("NAS Range response exceeded declared length"));
+        }
+        crate::traffic::throttle(chunk.len(), false).await;
+        body.extend_from_slice(&chunk);
+        if body.len() == expected {
+            break;
+        }
+    }
+    if body.len() != expected {
+        return Err(anyhow!("NAS Range response truncated"));
+    }
+    crate::traffic::TrafficCounter::new().add(0, body.len() as i64);
+    Ok(body)
+}
+
 #[cfg(test)]
 mod live_transfer_tests {
     #[tokio::test]
@@ -927,5 +1000,42 @@ mod live_transfer_tests {
             .unwrap()
             .iter()
             .any(|e| e.name == "renamed.txt"));
+    }
+}
+
+#[cfg(test)]
+mod range_response_tests {
+    use super::*;
+    async fn response(raw: &'static str) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).await;
+            socket.write_all(raw.as_bytes()).await.unwrap();
+        });
+        reqwest::get(format!("http://{address}/file"))
+            .await
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn bounded_range_requires_206_and_matching_offset() {
+        let valid = response("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 32768-32771/4294967296\r\n\r\nABCD").await;
+        assert_eq!(read_range_body(valid, 32768, 4).await.unwrap(), b"ABCD");
+        let ignored = response("HTTP/1.1 200 OK\r\nContent-Length: 4294967296\r\n\r\n").await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), read_range_body(ignored, 0, 512))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        let wrong = response("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 0-3/4294967296\r\n\r\nABCD").await;
+        assert!(read_range_body(wrong, 32768, 4).await.is_err());
+        let oversized = response("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 0-3/4294967296\r\n\r\nABCD").await;
+        assert!(read_range_body(oversized, 0, 2).await.is_err());
+        let truncated = response("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 0-3/4294967296\r\n\r\nAB").await;
+        assert!(read_range_body(truncated, 0, 4).await.is_err());
     }
 }

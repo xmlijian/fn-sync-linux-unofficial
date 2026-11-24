@@ -42,6 +42,10 @@ const MAX_DIRS_PER_POLL: usize = 8;
 const ROOT_POLL_TICKS: u32 = 2; // worker 每 tick 2s，差异轮询每 4s
 const EVICT_TICKS: u32 = 15; // 每 30s 检查一次缓存淘汰
 const DIR_SIZE: u64 = 4096;
+const RANGE_THRESHOLD: u64 = 16 * 1024 * 1024;
+const RANGE_BLOCK_BYTES: usize = 256 * 1024;
+const MAX_RANGE_BLOCKS: usize = 16;
+type RangeKey = (String, u64, (u64, i64));
 
 pub const ROOT_INO: u64 = 1;
 
@@ -279,6 +283,8 @@ pub struct Shared {
     pub queued_downloads: DashMap<String, ()>,
     pub control_slots: tokio::sync::Semaphore,
     read_slots: Arc<tokio::sync::Semaphore>,
+    range_slots: tokio::sync::Semaphore,
+    range_cache: Mutex<HashMap<RangeKey, Arc<Vec<u8>>>>,
     download_slots: tokio::sync::Semaphore,
     pin_lock: Mutex<()>,
     open_gate: Mutex<()>,
@@ -323,6 +329,8 @@ impl Shared {
             queued_downloads: DashMap::new(),
             control_slots: tokio::sync::Semaphore::new(4),
             read_slots: Arc::new(tokio::sync::Semaphore::new(128)),
+            range_slots: tokio::sync::Semaphore::new(4),
+            range_cache: Mutex::new(HashMap::new()),
             download_slots: tokio::sync::Semaphore::new(4),
             pin_lock: Mutex::new(()),
             open_gate: Mutex::new(()),
@@ -976,6 +984,9 @@ impl Shared {
             self.cache.set_state(rel, st);
         }
         self.cache.remove(rel);
+        self.range_cache
+            .lock()
+            .retain(|(path, _, _), _| path != rel);
         self.errors.remove(rel);
         if let Some(ino) = self.ino_by_rel.get(rel).map(|v| *v) {
             self.notify_inode(ino);
@@ -1097,6 +1108,78 @@ impl Shared {
         self.mark_meta_dirty();
         self.notify_inode(ino);
         Ok(())
+    }
+
+    /// Read clean large placeholders in bounded ranges. File manager MIME probes must
+    /// never materialize multi-GB files after the user explicitly freed local content.
+    /// Ranges are only a bounded memory cache and do not change the downloaded state.
+    pub async fn read_placeholder(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>> {
+        let rel = self
+            .inodes
+            .get(&ino)
+            .ok_or_else(|| anyhow!("no inode"))?
+            .read()
+            .rel
+            .clone();
+        let lock = self.cache.lock_for(&rel);
+        // Serialize with resize/write/upload, but never wait a full ISO hydration.
+        let _guard = tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(1), lock.lock()) =>
+                result.map_err(|_| anyhow!(std::io::Error::from_raw_os_error(libc::EAGAIN)))?,
+            _ = self.wait_stopping() => anyhow::bail!("挂载正在停止"),
+        };
+        let node = self
+            .inodes
+            .get(&ino)
+            .ok_or_else(|| anyhow!("no inode"))?
+            .read()
+            .clone();
+        if node.dirty {
+            anyhow::bail!("文件正在修改，请重试");
+        }
+        let length = (size as u64).min(node.size.saturating_sub(offset)) as usize;
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let mut result = Vec::with_capacity(length);
+        let mut cursor = offset;
+        while result.len() < length {
+            let block = cursor / RANGE_BLOCK_BYTES as u64 * RANGE_BLOCK_BYTES as u64;
+            let key = (node.rel.clone(), block, node.stamp);
+            let cached = self.range_cache.lock().get(&key).cloned();
+            let data = if let Some(data) = cached {
+                data
+            } else {
+                let _permit = tokio::select! {
+                    p = self.range_slots.acquire() => p.map_err(|_|anyhow!("分段读取队列关闭"))?,
+                    _ = self.wait_stopping() => anyhow::bail!("挂载正在停止"),
+                };
+                let count = RANGE_BLOCK_BYTES.min(node.size.saturating_sub(block) as usize);
+                let remote = self.remote_path(&node.rel);
+                let bytes = tokio::select! {
+                    r = self.nas.read_range(&remote, block, count) => r?,
+                    _ = self.wait_stopping() => anyhow::bail!("挂载正在停止"),
+                };
+                if bytes.len() != count {
+                    anyhow::bail!("远端文件大小已变化，请刷新后重试");
+                }
+                let bytes = Arc::new(bytes);
+                let mut cache = self.range_cache.lock();
+                if cache.len() >= MAX_RANGE_BLOCKS {
+                    cache.clear();
+                }
+                cache.insert(key, bytes.clone());
+                bytes
+            };
+            let start = (cursor - block) as usize;
+            let count = (length - result.len()).min(data.len().saturating_sub(start));
+            if count == 0 {
+                anyhow::bail!("远端分段内容不完整");
+            }
+            result.extend_from_slice(&data[start..start + count]);
+            cursor += count as u64;
+        }
+        Ok(result)
     }
 
     /// 确保内容已缓存（等价官方 DemandWriter）：下载远端内容到缓存。
@@ -1927,7 +2010,24 @@ impl Filesystem for OnDemandFs {
         let shared = self.shared.clone();
         if !write && !truncate {
             shared.inc_open(ino);
-            reply.opened(ino, 0);
+            let direct = shared
+                .inodes
+                .get(&ino)
+                .map(|inode| {
+                    let node = inode.read();
+                    node.size >= RANGE_THRESHOLD
+                        && !node.dirty
+                        && !shared.cached_content_ok(&node.rel, node.size)
+                })
+                .unwrap_or(false);
+            reply.opened(
+                ino,
+                if direct {
+                    fuser::consts::FOPEN_DIRECT_IO
+                } else {
+                    0
+                },
+            );
             return;
         }
         shared.inc_open(ino);
@@ -1968,7 +2068,7 @@ impl Filesystem for OnDemandFs {
 
     fn read(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino: u64,
         _fh: u64,
         offset: i64,
@@ -2016,6 +2116,17 @@ impl Filesystem for OnDemandFs {
             }
             return;
         }
+        let ranged = shared
+            .inodes
+            .get(&ino)
+            .map(|inode| {
+                let node = inode.read();
+                node.size >= RANGE_THRESHOLD
+                    && !node.dirty
+                    && !shared.cached_content_ok(&node.rel, node.size)
+            })
+            .unwrap_or(false);
+        let pid = req.pid();
         // Waiting for the same file never occupies an OS worker thread.
         let Ok(slot) = shared.read_slots.clone().try_acquire_owned() else {
             reply.error(libc::EAGAIN);
@@ -2025,6 +2136,27 @@ impl Filesystem for OnDemandFs {
         rt.spawn(async move {
             let _slot = slot;
             let result = async {
+                if ranged {
+                    if offset < 65536 {
+                        tracing::info!(
+                            pid,
+                            ino,
+                            offset,
+                            size,
+                            "large placeholder range read (no full download)"
+                        );
+                    }
+                    return shared
+                        .read_placeholder(ino, offset.max(0) as u64, size)
+                        .await;
+                }
+                tracing::info!(
+                    pid,
+                    ino,
+                    offset,
+                    size,
+                    "placeholder hydration triggered by file read"
+                );
                 shared.hydrate(ino).await?;
                 let file = shared.open_handle(ino)?;
                 let mut buf = vec![0u8; size as usize];
@@ -2034,7 +2166,14 @@ impl Filesystem for OnDemandFs {
             .await;
             match result {
                 Ok(bytes) => reply.data(&bytes),
-                Err(_) => reply.error(libc::EIO),
+                Err(error) => {
+                    tracing::warn!(pid, ino, offset, size, %error, "file read failed");
+                    let code = error
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(|e| e.raw_os_error())
+                        .unwrap_or(libc::EIO);
+                    reply.error(code);
+                }
             }
         });
     }

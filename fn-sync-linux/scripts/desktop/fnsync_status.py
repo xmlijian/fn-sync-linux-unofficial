@@ -74,8 +74,8 @@ def _label(path):
     if state is None or state == "directory":
         return ""
     if state in ("download", "upload"):
-        return f"{LABEL.get(state, state)} {_xattr(path, 'user.fnsync.progress')}%"
-    return LABEL.get(state, state)
+        return f"{LABEL.get(state, "状态未知")} {_xattr(path, 'user.fnsync.progress')}%"
+    return LABEL.get(state, "状态未知")
 
 
 def _run(args):

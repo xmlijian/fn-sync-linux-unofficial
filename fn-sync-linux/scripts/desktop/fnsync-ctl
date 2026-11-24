@@ -19,6 +19,9 @@ def notify(title, body):
         pass
 
 
+ACTION_LABEL = {"download": "下载到本地", "free": "释放空间", "pin": "始终保留在此电脑", "unpin": "取消始终保留", "status": "查看状态"}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=["download", "free", "pin", "unpin", "status"])
@@ -50,8 +53,8 @@ def main():
                             last = state["progress"]
                             notify(f"下载中 {last}%", f'{name}\n{state["done"]} / {state["total"]} 字节')
                         time.sleep(0.5)
-                print(f"{args.action}: {name}")
-            notify("操作完成", f"{args.action}: {len(files)} 个文件")
+                print(f"{ACTION_LABEL[args.action]}：{name}")
+            notify("操作完成", f"{ACTION_LABEL[args.action]}：{len(files)} 个文件")
         except (OSError, ValueError, RuntimeError) as error:
             failed += 1
             print(f"{path}: {error}", file=sys.stderr)

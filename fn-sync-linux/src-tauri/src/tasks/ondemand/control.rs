@@ -357,3 +357,173 @@ mod integration_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod large_placeholder_tests {
+    use super::*;
+    use crate::{
+        connect::nas_client::RemoteEntry,
+        service::database,
+        tasks::{
+            file_filter::FileFilter,
+            ondemand::{remote::RemoteOps, OnDemandConfig},
+        },
+    };
+    use futures_util::future::BoxFuture;
+    use std::sync::atomic::AtomicU64;
+    struct RangeOnlyNas {
+        bytes: AtomicU64,
+        full: AtomicU64,
+    }
+    impl RemoteOps for RangeOnlyNas {
+        fn ls<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Vec<RemoteEntry>>> {
+            Box::pin(async {
+                Ok(vec![RemoteEntry {
+                    name: "large.iso".into(),
+                    size: 4 * 1024 * 1024 * 1024,
+                    mtim: 1,
+                    ..Default::default()
+                }])
+            })
+        }
+        fn mkdir<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { anyhow::bail!("unexpected mutation") })
+        }
+        fn remove<'a>(&'a self, _: &'a [String]) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { anyhow::bail!("unexpected mutation") })
+        }
+        fn rename<'a>(&'a self, _: &'a str, _: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { anyhow::bail!("unexpected mutation") })
+        }
+        fn download<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
+            Box::pin(async {
+                self.full.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("full download forbidden")
+            })
+        }
+        fn download_to<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a std::path::Path,
+            _: Arc<dyn Fn(u64) + Send + Sync>,
+        ) -> BoxFuture<'a, Result<u64>> {
+            Box::pin(async {
+                self.full.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("full download forbidden")
+            })
+        }
+        fn upload<'a>(
+            &'a self,
+            _: &'a str,
+            _: Vec<u8>,
+            _: Option<i64>,
+        ) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { anyhow::bail!("unexpected mutation") })
+        }
+        fn read_range<'a>(
+            &'a self,
+            _: &'a str,
+            offset: u64,
+            size: usize,
+        ) -> BoxFuture<'a, Result<Vec<u8>>> {
+            Box::pin(async move {
+                self.bytes.fetch_add(size as u64, Ordering::Relaxed);
+                Ok((offset..offset + size as u64)
+                    .map(|n| (n % 251) as u8)
+                    .collect())
+            })
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn four_gib_mime_probes_never_hydrate_or_recreate_released_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nas = Arc::new(RangeOnlyNas {
+            bytes: AtomicU64::new(0),
+            full: AtomicU64::new(0),
+        });
+        let db = database::open_db(&tmp.path().join("db.sqlite"))
+            .await
+            .unwrap();
+        database::migrate(&db).await.unwrap();
+        let shared = Shared::new(
+            OnDemandConfig {
+                task_id: 1,
+                task_name: "range-test".into(),
+                mountpoint: tmp.path().join("mount"),
+                nas_root: "root".into(),
+                cache_root: tmp.path().join("cache"),
+                cache_limit_bytes: 1024 * 1024,
+            },
+            nas.clone(),
+            tokio::runtime::Handle::current(),
+            db,
+            FileFilter::from_db(None),
+        )
+        .unwrap();
+        let ino = shared
+            .resolve_child(ROOT_INO, std::ffi::OsStr::new("large.iso"))
+            .await
+            .unwrap()
+            .unwrap();
+        // Simulate a cached ISO that was released, then Nautilus/GIO sniffing several offsets.
+        let cached = std::fs::File::create(shared.cache.file_path("large.iso")).unwrap();
+        cached.set_len(4 * 1024 * 1024 * 1024).unwrap();
+        drop(cached);
+        shared.release("large.iso").unwrap();
+        for (offset, size) in [(0, 512), (32768, 2048), (65536, 131072)] {
+            let data = shared.read_placeholder(ino, offset, size).await.unwrap();
+            assert_eq!(data.len(), size as usize);
+            assert_eq!(data[0], (offset % 251) as u8);
+        }
+        assert_eq!(nas.full.load(Ordering::Relaxed), 0);
+        assert_eq!(nas.bytes.load(Ordering::Relaxed), 256 * 1024);
+        assert!(!shared.cache.file_path("large.iso").exists());
+        assert_eq!(
+            shared.file_state(&shared.inodes.get(&ino).unwrap().read()),
+            "placeholder"
+        );
+        let last = shared
+            .read_placeholder(ino, 4 * 1024 * 1024 * 1024 - 512, 4096)
+            .await
+            .unwrap();
+        assert_eq!(last.len(), 512);
+        assert_eq!(nas.full.load(Ordering::Relaxed), 0);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires /dev/fuse; fake 4GiB NAS only"]
+    async fn fuse_four_gib_mime_reads_remain_placeholder() {
+        use crate::tasks::ondemand::OnDemandMount;
+        use std::io::{Read, Seek, SeekFrom};
+        let tmp = tempfile::tempdir().unwrap();
+        let nas = Arc::new(RangeOnlyNas {
+            bytes: AtomicU64::new(0),
+            full: AtomicU64::new(0),
+        });
+        let db = database::open_db(&tmp.path().join("db.sqlite"))
+            .await
+            .unwrap();
+        database::migrate(&db).await.unwrap();
+        let cfg = OnDemandConfig {
+            task_id: 1,
+            task_name: "range-fuse".into(),
+            mountpoint: tmp.path().join("mount"),
+            nas_root: "root".into(),
+            cache_root: tmp.path().join("cache"),
+            cache_limit_bytes: 1024 * 1024,
+        };
+        let mount =
+            OnDemandMount::start(cfg.clone(), nas.clone(), db, FileFilter::from_db(None)).unwrap();
+        let mut file = std::fs::File::open(cfg.mountpoint.join("large.iso")).unwrap();
+        for offset in [0, 32768, 65536, 4 * 1024 * 1024 * 1024 - 512] {
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            let mut bytes = [0; 512];
+            file.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes[0], (offset % 251) as u8);
+        }
+        drop(file);
+        assert_eq!(nas.full.load(Ordering::Relaxed), 0);
+        assert!(nas.bytes.load(Ordering::Relaxed) <= 512 * 1024);
+        assert!(!mount.shared.cache.file_path("large.iso").exists());
+        mount.stop().unwrap();
+    }
+}

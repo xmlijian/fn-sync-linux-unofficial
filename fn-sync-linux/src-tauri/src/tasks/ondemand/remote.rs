@@ -17,6 +17,15 @@ pub trait RemoteOps: Send + Sync + 'static {
     fn mkdir<'a>(&'a self, path: &'a str) -> BoxFuture<'a, Result<()>>;
     fn remove<'a>(&'a self, paths: &'a [String]) -> BoxFuture<'a, Result<()>>;
     fn rename<'a>(&'a self, path: &'a str, new_name: &'a str) -> BoxFuture<'a, Result<()>>;
+    /// Bounded random read without materializing the whole file.
+    fn read_range<'a>(
+        &'a self,
+        _remote: &'a str,
+        _offset: u64,
+        _size: usize,
+    ) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async { anyhow::bail!("远端不支持分段读取，请使用下载到本地") })
+    }
     fn download<'a>(&'a self, remote: &'a str) -> BoxFuture<'a, Result<Vec<u8>>>;
     /// 流式下载到文件（不整文件进内存），`progress` 每块回调累计字节数。
     fn download_to<'a>(
@@ -228,6 +237,18 @@ impl RemoteOps for ReconnectingRemote {
         })
     }
 
+    fn read_range<'a>(
+        &'a self,
+        remote: &'a str,
+        offset: u64,
+        size: usize,
+    ) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move {
+            od_op!(self, "read_range", OP_TIMEOUT, |s| RemoteOps::read_range(
+                &**s, remote, offset, size
+            ))
+        })
+    }
     fn download<'a>(&'a self, remote: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {
             od_op!(self, "download", DOWNLOAD_TIMEOUT, |s| RemoteOps::download(
@@ -294,6 +315,21 @@ impl RemoteOps for NasClient {
         })
     }
 
+    fn read_range<'a>(
+        &'a self,
+        remote: &'a str,
+        offset: u64,
+        size: usize,
+    ) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move {
+            within(
+                OP_TIMEOUT,
+                "read_range",
+                NasClient::read_range(self, remote, offset, size),
+            )
+            .await
+        })
+    }
     fn download<'a>(&'a self, remote: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {
             within(
@@ -553,6 +589,22 @@ pub(crate) mod fake {
             })
         }
 
+        fn read_range<'a>(
+            &'a self,
+            remote: &'a str,
+            offset: u64,
+            size: usize,
+        ) -> BoxFuture<'a, Result<Vec<u8>>> {
+            Box::pin(async move {
+                let nodes = self.nodes.read();
+                let node = nodes
+                    .get(remote.trim_matches('/'))
+                    .ok_or_else(|| anyhow::anyhow!("not found"))?;
+                let start = (offset as usize).min(node.data.len());
+                let end = start.saturating_add(size).min(node.data.len());
+                Ok(node.data[start..end].to_vec())
+            })
+        }
         fn download<'a>(&'a self, remote: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
             let remote = remote.trim_matches('/').to_string();
             Box::pin(async move {
