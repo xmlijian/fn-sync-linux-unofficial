@@ -78,3 +78,8 @@ cd fn-sync-linux-webkit40
 构建产物、`target/`、`node_modules/`、`artifacts/` 中的二进制不进 git。
 
 本地工作资料（逆向抓包、兼容性调研、官方安装包等）不纳入本仓库。
+
+## 许可证
+
+本项目代码以 [GPL-3.0](LICENSE) 发布。`official-ui/`、`icons/` 等来源于官方安装包的
+资源不在此许可证覆盖范围内，权利归原权利人所有。

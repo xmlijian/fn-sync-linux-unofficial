@@ -47,7 +47,7 @@
 ## 私有 → 公开检查清单
 
 - [ ] 根 README 顶部保留非官方声明；
-- [ ] 补充 LICENSE（当前无）；
+- [x] 补充 LICENSE（GPL-3.0，2026-11-26）；
 - [ ] 确认 `official-ui/`、`icons/`、`protocol-docs/` 的保留决定（当前决定保留，
       来源为官方安装包）；
 - [ ] 确认 Release 资产中不含个人 NAS 地址、账号、token 等调试残留；
