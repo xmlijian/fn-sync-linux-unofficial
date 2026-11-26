@@ -14,7 +14,9 @@
 | 资产 | 对应版本 | 系统 |
 |---|---|---|
 | `fn-sync-client_X.Y.Z-<rev>_amd64.deb` | 新系统版 | Ubuntu 22.04+/Debian 12+（amd64） |
+| `fn-sync-client_X.Y.Z-<rev>_arm64.deb` | 新系统版 | Ubuntu 22.04+/Debian 12+（aarch64） |
 | `fn-sync-client-X.Y.Z-x86_64.AppImage` | 新系统版 | 通用 x86_64 |
+| `fn-sync-client-X.Y.Z-aarch64.AppImage` | 新系统版 | 通用 aarch64 |
 | `fn-sync-client_X.Y.Z-xinchuang_amd64.deb` | 信创版 | 麒麟 V10 / UOS（x86_64） |
 | `fn-sync-client_X.Y.Z-xinchuang_arm64.deb` | 信创版 | 麒麟 V10 / UOS（aarch64） |
 | `fn-sync-client-X.Y.Z-xinchuang-x86_64.AppImage` | 信创版 | 通用 x86_64 |

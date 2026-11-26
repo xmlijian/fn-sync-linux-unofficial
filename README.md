@@ -36,7 +36,7 @@
 | UOS 20 专业版 | 未记录 | x86_64 | deb 安装、DDE 文件管理器集成、按需同步 |
 
 新系统版：Ubuntu 26.04 LTS（x86_64）完成 deb / AppImage 构建与运行验证；
-aarch64 产物在 Ubuntu 22.04 arm64 环境中构建，真机验证待补。
+aarch64 产物在 Ubuntu 22.04 arm64 环境中构建（glibc 符号上限 2.34），真机验证待补。
 
 其它架构（如龙芯 loongarch64）尚未构建和验证。
 

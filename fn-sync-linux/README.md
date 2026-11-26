@@ -29,6 +29,11 @@ cd src-tauri && cargo build --release && cd ..
 ./scripts/build-appimage.sh
 # 产物: artifacts/fn-sync-client-0.2.3-x86_64.AppImage
 # 交付目录: artifacts/新系统版/（deb + AppImage + SHA256SUMS.txt）
+
+# aarch64：在 ubuntu:22.04 arm64 环境（原生或 qemu 模拟）执行相同步骤：
+#   ./debian-build.sh && ./scripts/build-appimage.sh
+# 产物: fn-sync-client_0.2.3-20_arm64.deb、fn-sync-client-0.2.3-aarch64.AppImage
+# 基线: glibc 2.34（Ubuntu 22.04 arm64 / Debian 12 arm64 可运行）
 ```
 
 ## 测试
@@ -86,7 +91,7 @@ FN_SYNC_UI_FIXTURES=/tmp/fn-ui-fixtures.json node scripts/qa-ui-smoke.cjs
 ```
 
 已验证环境：Ubuntu 26.04 LTS（x86_64）完成 deb / AppImage 构建与运行验证；
-aarch64 产物在 Ubuntu 22.04 arm64 环境构建，真机验证待补。
+aarch64 产物在 Ubuntu 22.04 arm64 环境构建（glibc 符号上限 2.34），真机验证待补。
 麒麟/UOS 的指定版本请使用信创版；龙芯等其它目标架构仍需在对应系统上构建和运行验证。
 
 
