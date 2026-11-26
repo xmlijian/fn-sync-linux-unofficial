@@ -13,10 +13,12 @@
 
 | 资产 | 对应版本 | 系统 |
 |---|---|---|
-| `fn-sync-client_X.Y.Z_amd64.deb` | 新系统版 | Ubuntu 22.04+/Debian 12+（amd64） |
-| `fn-sync-client_X.Y.Z_x86_64.AppImage` | 新系统版 | 通用 x86_64 |
-| `fn-sync-client_X.Y.Z_xinchuang_amd64.deb` | 信创版 | 麒麟 V10 / UOS（x86_64） |
-| `fn-sync-client_X.Y.Z_xinchuang_arm64.deb` | 信创版 | 麒麟 V10 / UOS（aarch64） |
+| `fn-sync-client_X.Y.Z-<rev>_amd64.deb` | 新系统版 | Ubuntu 22.04+/Debian 12+（amd64） |
+| `fn-sync-client-X.Y.Z-x86_64.AppImage` | 新系统版 | 通用 x86_64 |
+| `fn-sync-client_X.Y.Z-web40_amd64.deb` | 信创版 | 麒麟 V10 / UOS（x86_64） |
+| `fn-sync-client_X.Y.Z-web40_arm64.deb` | 信创版 | 麒麟 V10 / UOS（aarch64） |
+| `fn-sync-client-X.Y.Z-web40-x86_64.AppImage` | 信创版 | 通用 x86_64 |
+| `fn-sync-client-X.Y.Z-web40-aarch64.AppImage` | 信创版 | 通用 aarch64 |
 | `SHA256SUMS.txt` | 全部 | 校验文件 |
 
 ## 发布步骤
