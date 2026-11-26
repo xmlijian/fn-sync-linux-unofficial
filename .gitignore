@@ -1,0 +1,29 @@
+# 构建产物
+**/target/
+**/node_modules/
+**/dist/
+**/src-tauri/gen/
+**/plugins/*/build/
+**/artifacts/
+
+# 安装包与压缩包
+*.deb
+*.AppImage
+*.rpm
+*.tar.gz
+
+# 本地配置与数据
+*.sqlite*
+.env
+
+# 缓存
+**/__pycache__/
+*.pyc
+
+# 工具状态（oh-my-claudecode / oh-my-codex）
+**/.omc/
+**/.omx/
+
+# 日志与临时文件
+*.log
+**/tmp/
