@@ -1,24 +1,34 @@
 #!/usr/bin/env bash
-# 构建新系统版（Tauri 2 / webkit2gtk-4.1）AppImage（x86_64，本机构建）。
+# 构建新系统版（Tauri 2 / webkit2gtk-4.1）AppImage。
+#
+# 默认按本机架构构建（x86_64 / aarch64）。交叉或在容器内构建时可覆盖：
+#   ARCH=aarch64 BIN=.../target/aarch64-unknown-linux-gnu/release/fn-sync-client \
+#     ./scripts/build-appimage.sh
 #
 # 运行依赖系统自带的 libwebkit2gtk-4.1 / libgtk-3 / libsoup-3.0 / fuse；
-# 二进制在本机编译，因此和本机 glibc 基线一致（Ubuntu 24.04+ / Debian 13+ 等）。
+# 二进制在本机编译，因此和本机 glibc 基线一致。
 #
 # 不使用 appimagetool/linuxdeploy：runtime（AppImageKit 官方）+ squashfs(xz) 拼装。
-# 产物：artifacts/fn-sync-client-<version>-x86_64.AppImage
+# 产物：artifacts/fn-sync-client-<version>-<arch>.AppImage
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION="${VERSION:-0.2.3}"
-BIN="$ROOT/src-tauri/target/release/fn-sync-client"
+ARCH="${ARCH:-$(uname -m)}"
+case "$ARCH" in
+  x86_64|amd64) APPIMAGE_ARCH=x86_64 ;;
+  aarch64|arm64) APPIMAGE_ARCH=aarch64 ;;
+  *) echo "不支持的架构: $ARCH（可用: x86_64, aarch64）" >&2; exit 2 ;;
+esac
+BIN="${BIN:-$ROOT/src-tauri/target/release/fn-sync-client}"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/fn-sync-appimage"
 
 [ -x "$BIN" ] || { echo "缺少 $BIN，先执行: cd src-tauri && cargo build --release" >&2; exit 2; }
 
 mkdir -p "$CACHE" "$ROOT/artifacts"
-if [ ! -s "$CACHE/runtime-x86_64" ]; then
-    curl -sL --max-time 120 -o "$CACHE/runtime-x86_64" \
-        https://github.com/AppImage/AppImageKit/releases/download/continuous/runtime-x86_64
+if [ ! -s "$CACHE/runtime-$APPIMAGE_ARCH" ]; then
+    curl -sL --max-time 120 -o "$CACHE/runtime-$APPIMAGE_ARCH" \
+        "https://github.com/AppImage/AppImageKit/releases/download/continuous/runtime-$APPIMAGE_ARCH"
 fi
 
 WORK="$(mktemp -d)"
@@ -48,8 +58,8 @@ chmod 755 "$APPDIR/AppRun"
 
 mksquashfs "$APPDIR" "$WORK/app.squashfs" -comp xz -noappend -no-progress -all-root >/dev/null
 
-OUT="$ROOT/artifacts/fn-sync-client-${VERSION}-x86_64.AppImage"
-cat "$CACHE/runtime-x86_64" "$WORK/app.squashfs" > "$OUT"
+OUT="$ROOT/artifacts/fn-sync-client-${VERSION}-${APPIMAGE_ARCH}.AppImage"
+cat "$CACHE/runtime-$APPIMAGE_ARCH" "$WORK/app.squashfs" > "$OUT"
 chmod 755 "$OUT"
 echo "==> $OUT"
 ls -lh "$OUT"

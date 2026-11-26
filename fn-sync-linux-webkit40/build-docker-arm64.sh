@@ -15,7 +15,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 CONTAINER="${CONTAINER:-webkit40-arm}"
 TARGET=aarch64-unknown-linux-gnu
-REVISION="${REVISION:-web40}"
+REVISION="${REVISION:-xinchuang}"
 GIT_HASH="${GIT_HASH:-dev}"
 
 docker start "$CONTAINER" >/dev/null

@@ -25,6 +25,21 @@
 预构建安装包见 [Releases](https://github.com/xmlijian/fn-sync-linux-unofficial/releases)，
 包含 deb 与 AppImage，附 `SHA256SUMS.txt` 校验文件。
 
+## 已验证环境
+
+信创版（真机安装验证）：
+
+| 系统 | CPU | 架构 | 验证内容 |
+|---|---|---|---|
+| 麒麟 V10 SP1 | 飞腾 D2000 | aarch64 | deb 安装、Peony 文件管理器集成、按需同步 |
+| 麒麟 V10 SP1 | 麒麟 990 | aarch64 | deb 安装、wayland 会话显示、按需同步 |
+| UOS 20 专业版 | 未记录 | x86_64 | deb 安装、DDE 文件管理器集成、按需同步 |
+
+新系统版：Ubuntu 26.04 LTS（x86_64）完成 deb / AppImage 构建与运行验证；
+aarch64 产物在 Ubuntu 22.04 arm64 环境中构建，真机验证待补。
+
+其它架构（如龙芯 loongarch64）尚未构建和验证。
+
 ## 两份代码的关系
 
 业务代码同源，差异只在框架胶水和平台集成：

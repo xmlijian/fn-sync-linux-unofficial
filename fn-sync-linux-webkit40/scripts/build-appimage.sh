@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 构建 web40（Tauri 1 / webkit2gtk-4.0）AppImage：x86_64 与 aarch64。
+# 构建 xinchuang（Tauri 1 / webkit2gtk-4.0）AppImage：x86_64 与 aarch64。
 #
 # AppImage 是用户态单文件，不安装 Peony/DDE 文件管理器插件，所以 AppImage 版
 # 没有右键菜单和状态角标（同步、托盘、按需同步正常）。
@@ -10,13 +10,13 @@
 # 这样 aarch64 包也不需要 qemu 或本机跑 arm 程序。
 #
 # 前置：两个架构的 release 二进制已经构建好（build-docker.sh / build-docker-arm64.sh）
-# 产物：artifacts/fn-sync-client-<version>-web40-<arch>.AppImage
+# 产物：artifacts/fn-sync-client-<version>-xinchuang-<arch>.AppImage
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONTAINER="${CONTAINER:-webkit40-build}"
 VERSION="${VERSION:-0.2.3}"
-REVISION="${REVISION:-web40}"
+REVISION="${REVISION:-xinchuang}"
 
 docker start "$CONTAINER" >/dev/null 2>&1 || true
 

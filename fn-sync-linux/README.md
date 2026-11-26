@@ -85,7 +85,9 @@ FN_SYNC_UI_FIXTURES=/tmp/fn-ui-fixtures.json GIT_HASH=qa cargo test --manifest-p
 FN_SYNC_UI_FIXTURES=/tmp/fn-ui-fixtures.json node scripts/qa-ui-smoke.cjs
 ```
 
-当前验证机器为 x86_64 Linux。麒麟/UOS 的指定版本、ARM/龙芯等目标架构仍需在对应系统上构建和运行验证。
+已验证环境：Ubuntu 26.04 LTS（x86_64）完成 deb / AppImage 构建与运行验证；
+aarch64 产物在 Ubuntu 22.04 arm64 环境构建，真机验证待补。
+麒麟/UOS 的指定版本请使用信创版；龙芯等其它目标架构仍需在对应系统上构建和运行验证。
 
 
 ## 日志与设置

@@ -13,7 +13,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 CONTAINER="${CONTAINER:-webkit40-build}"
-REVISION="${REVISION:-web40}"
+REVISION="${REVISION:-xinchuang}"
 GIT_HASH="${GIT_HASH:-dev}"
 # 容器内 rustup 工具链位置
 CARGO_PATH=/root/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:/usr/local/cargo/bin
