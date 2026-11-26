@@ -1,0 +1,63 @@
+{
+  "package": {
+    "productName": "飞牛同步",
+    "version": "0.2.3"
+  },
+  "build": {
+    "distDir": "../official-ui",
+    "devPath": "../official-ui",
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
+    "withGlobalTauri": true
+  },
+  "tauri": {
+    "bundle": {
+      "active": true,
+      "identifier": "com.fn-sync-client.app",
+      "targets": [
+        "deb"
+      ],
+      "icon": [
+        "icons/32x32.png",
+        "icons/128x128.png",
+        "icons/128x128@2x.png",
+        "icons/icon.png"
+      ],
+      "category": "Utility"
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "飞牛同步",
+        "width": 960,
+        "height": 680,
+        "minWidth": 760,
+        "minHeight": 560,
+        "resizable": true,
+        "decorations": false,
+        "visible": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    },
+    "allowlist": {
+      "all": false,
+      "window": {
+        "all": true
+      },
+      "dialog": {
+        "all": true
+      },
+      "shell": {
+        "all": true
+      }
+    },
+    "systemTray": {
+      "title": "飞牛同步",
+      "iconPath": "icons/tray.png",
+      "iconAsTemplate": false
+    }
+  }
+}

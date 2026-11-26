@@ -1,0 +1,140 @@
+[package]
+name = "fn-sync-client"
+version = "0.2.3"
+description = "飞牛同步 Linux 客户端（国产化系统适配版）"
+edition = "2021"
+license = "GPL-3.0"
+
+[lib]
+name = "fn_sync_client_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "1", features = [] }
+
+[dependencies]
+# Tauri 1.x：目标系统（麒麟 V10 SP1 / UOS 20）仅有 webkit2gtk-4.0(libsoup2) 运行库，
+# Tauri2 需要 webkit2gtk-4.1(libsoup3) 在这些系统上不存在（见 compat-test/编译规划.md）。
+# tray 在 v1 为内置能力，无需 feature；devtools 用于自绘标题栏调试。
+tauri = { version = "1.6", features = ["devtools", "system-tray", "icon-png", "window-all", "dialog-all", "shell-all"] }
+# v2 的 tauri::Url 为 url::Url 的 re-export；v1 不再 re-export，显式依赖保持调用点行为不变
+url = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream", "multipart"], default-features = false }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+axum = { version = "0.8", features = ["http1", "tokio", "ws"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+futures-util = "0.3"
+prost = "0.14"
+md-5 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.9"
+rand_core = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes-gcm = "0.10"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+rsa = "0.9"
+base64 = "0.22"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+mdns-sd = "0.14"
+notify = "8"
+regex = "1"
+once_cell = "1"
+parking_lot = "0.12"
+dashmap = "6"
+lru = "0.12"
+libc = "0.2"
+open = "5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# v1 生态使用 webkit2gtk 0.18（GTK3 + libsoup2 绑定），与目标系统 libwebkit2gtk-4.0-37 2.38.6 匹配
+webkit2gtk = { version = "0.18", features = ["v2_10"] }
+# 按需同步：FUSE3 用户态挂载。
+# default-features = false → 使用 fuser 的纯 Rust 挂载实现：
+#   · 构建期不链接 libfuse3（目标机无需 libfuse3-3 运行库）
+#   · 运行期先直接 mount(2)，非特权场景回退 fusermount3 / fusermount（fuse3 或 fuse 包提供）
+# 国产化系统（UOS 20 / 麒麟 V10）对 fuse3 的覆盖不一致，纯 Rust 路径依赖面最小。
+fuser = { version = "0.15", default-features = false, features = ["abi-7-11", "abi-7-12"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+
+[package.metadata.deb]
+maintainer = "fn-sync linux port"
+copyright = "Use of this software is for interoperability research"
+# 国产化系统（UOS 20 / 麒麟 V10）零额外依赖：webkit/gtk/soup 均为桌面预装组件。
+# 托盘指示器二者取一；FUSE 挂载器二者取一（fusermount3 或 fuse2 的 fusermount）。
+depends = "libwebkit2gtk-4.0-37, libjavascriptcoregtk-4.0-18, libgtk-3-0, libsoup2.4-1, libayatana-appindicator3-1 | libappindicator3-1, fuse3 | fuse"
+section = "utils"
+priority = "optional"
+# postinst/prerm：安装/卸载时注册 Peony 插件目录（见 debian/prerm 与本文件 variants.peony）。
+maintainer-scripts = "debian/"
+extended-description = """\
+飞牛同步 (FN Sync) Linux 客户端 — 与 fnOS NAS 同步服务互通的文件同步工具。
+本包为 Tauri 1.x / webkit2gtk-4.0 构建，面向麒麟 V10 SP1、UOS 20 等国产化系统。
+支持按需同步（open_cloud）：FUSE3 挂载，文件仅占位元数据，打开时才下载，缓存 LRU 淘汰释放磁盘。
+"""
+assets = [
+    ["../scripts/desktop/fnsync-ctl", "usr/bin/fnsync-ctl", "755"],
+    ["../scripts/desktop/fnsync_ipc.py", "usr/lib/fn-sync-client/", "644"],
+    ["../scripts/desktop/fnsync_menu.py", "usr/lib/fn-sync-client/", "644"],
+    ["../scripts/desktop/fnsync_status.py", "usr/share/nautilus-python/extensions/", "644"],
+    ["target/release/fn-sync-client", "usr/bin/fn-sync-client", "755"],
+    ["debian/fn-sync-client.desktop", "usr/share/applications/", "644"],
+    ["icons/128x128.png", "usr/share/icons/hicolor/128x128/apps/fn-sync-client.png", "644"],
+    ["icons/512x512.png", "usr/share/icons/hicolor/512x512/apps/fn-sync-client.png", "644"],
+    ["../icons/emblems/emblem-fnsync-online.svg", "usr/share/icons/hicolor/scalable/emblems/", "644"],
+    ["../icons/emblems/emblem-fnsync-local.svg", "usr/share/icons/hicolor/scalable/emblems/", "644"],
+    ["../icons/emblems/emblem-fnsync-downloading.svg", "usr/share/icons/hicolor/scalable/emblems/", "644"],
+    ["../icons/emblems/emblem-fnsync-uploading.svg", "usr/share/icons/hicolor/scalable/emblems/", "644"],
+    ["../icons/emblems/emblem-fnsync-modified.svg", "usr/share/icons/hicolor/scalable/emblems/", "644"],
+]
+
+# 麒麟 Kylin（aarch64）变体：附带 Peony 文件管理器插件（右键菜单 + 状态角标）。
+#   ./build-docker-arm64.sh   # 内部会先跑 scripts/build-peony-plugin.sh，再用该变体打包
+#
+# 直接装进 Peony 的插件扫描目录。cargo-deb 的 assets 路径不能按目标架构展开，
+# 所以这里写死 aarch64 的 multiarch 目录——该变体本来就只用于 arm64 构建。
+[package.metadata.deb.variants.peony]
+# 保持与原包同名，避免变成 fn-sync-client-peony。
+name = "fn-sync-client"
+# 只有装了 Peony 的麒麟才会让它生效；缺失时 dpkg 只提示，不阻止安装。
+recommends = "libpeony3"
+merge-assets.append = [
+    ["../plugins/peony/build/libfnsync-peony-menu.so", "usr/lib/aarch64-linux-gnu/peony-extensions/", "644"],
+    ["../plugins/peony/build/libfnsync-peony-emblem.so", "usr/lib/aarch64-linux-gnu/peony-extensions/", "644"],
+]
+
+# UOS/DDE 变体（amd64）：附带 DDE 文件管理器扩展（右键菜单 + 状态角标）。
+#   ./build-docker.sh   # 内部会先跑 scripts/build-dde-plugin.sh，再用该变体打包
+#
+# 注意 DDE 的扩展扫描器不跟随软链（实测软链 .so 不会被加载），必须装真实文件，
+# 所以这里同样直接写死 x86_64 的 multiarch 目录。
+[package.metadata.deb.variants.dde]
+name = "fn-sync-client"
+recommends = "libdfm-extension"
+merge-assets.append = [
+    ["../plugins/dde/build/libfnsync-dde.so", "usr/lib/x86_64-linux-gnu/dde-file-manager/plugins/extensions/", "644"],
+]

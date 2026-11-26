@@ -1,0 +1,774 @@
+//! 任务服务 — tasks / task_filter_rules 表（命令与官方一致）。
+
+use super::database::now_ms;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
+
+pub const MAX_TASKS: i64 = 100;
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Task {
+    pub id: i64,
+    pub nas_acc_id: i64,
+    pub name: String,
+    pub address: String,
+    pub conn_type: String,
+    pub uuid: String,
+    pub identifier: String,
+    pub mode: String,
+    pub nas_path: String,
+    pub pc_path: String,
+    pub status: i64,
+    pub is_init_sync: i64,
+    pub open_cloud: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TaskCreate {
+    pub name: String,
+    pub address: String,
+    pub conn_type: String,
+    pub uuid: String,
+    pub identifier: String,
+    pub mode: String,
+    pub nas_path: String,
+    pub pc_path: String,
+    #[serde(default)]
+    pub status: i64,
+    pub nas_acc_id: i64,
+    #[serde(default)]
+    pub is_init_sync: i64,
+    #[serde(default)]
+    pub filter_rule: Option<FilterRuleInput>,
+    #[serde(default, deserialize_with = "deserialize_flag")]
+    pub open_cloud: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FilterRuleInput {
+    #[serde(default = "default_true")]
+    pub ignore_dotfiles: i64,
+    #[serde(default = "default_true")]
+    pub enable_ignore_ext: i64,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_extensions",
+        serialize_with = "serialize_extensions"
+    )]
+    pub ignore_extensions: Vec<String>,
+    #[serde(default)]
+    pub enable_size_lower: i64,
+    #[serde(default, deserialize_with = "deserialize_optional_integer")]
+    pub size_lower_bound: Option<i64>,
+    #[serde(default)]
+    pub enable_size_upper: i64,
+    #[serde(default, deserialize_with = "deserialize_optional_integer")]
+    pub size_upper_bound: Option<i64>,
+}
+
+fn serialize_extensions<S: serde::Serializer>(
+    items: &[String],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&items.join(","))
+}
+
+fn deserialize_extensions<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Input {
+        List(Vec<String>),
+        Csv(String),
+    }
+    Ok(match Input::deserialize(d)? {
+        Input::List(list) => list,
+        Input::Csv(csv) => csv
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    })
+}
+
+fn deserialize_flag<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<i64, D::Error> {
+    let value = deserialize_optional_integer(d)?.unwrap_or(0);
+    if value == 0 || value == 1 {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom("expected boolean or 0/1"))
+    }
+}
+
+fn deserialize_optional_integer<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<i64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Input {
+        Number(i64),
+        Text(String),
+        Bool(bool),
+    }
+    match Option::<Input>::deserialize(d)? {
+        None => Ok(None),
+        Some(Input::Number(n)) => Ok(Some(n)),
+        Some(Input::Bool(b)) => Ok(Some(i64::from(b))),
+        Some(Input::Text(s)) if s.trim().is_empty() => Ok(None),
+        Some(Input::Text(s)) => s.parse().map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
+fn default_true() -> i64 {
+    1
+}
+
+impl FilterRuleInput {
+    pub fn default_rule() -> Self {
+        Self {
+            ignore_dotfiles: 1,
+            enable_ignore_ext: 1,
+            ignore_extensions: vec!["lnk".into(), "pst".into(), "swp".into()],
+            enable_size_lower: 0,
+            size_lower_bound: None,
+            enable_size_upper: 0,
+            size_upper_bound: None,
+        }
+    }
+}
+
+pub const VALID_MODES: &[&str] = &["bisynchronous", "uploadonly", "downloadonly"];
+
+/// 按需同步只能配合“双向同步”。
+///
+/// 官方前端的约束（已从 UI bundle 核实）：
+/// - 勾选按需同步后，“仅上传/仅下载”两个模式单选被 disabled；
+/// - 选择“仅上传/仅下载”会把 open_cloud 强制置 0。
+/// 后端必须自己再校验一次，否则会存在 (open_cloud=1, mode=uploadonly) 这种
+/// 非法组合，而挂载一旦建立就完全忽略 mode —— 表现为“仅上传”的任务却会下载。
+pub const ON_DEMAND_MODE: &str = "bisynchronous";
+
+/// 按需同步的电脑目录必须为空（不存在会自动创建）。
+///
+/// 官方 macOS 客户端用 FileProvider，同步目录固定在 `~/Library/CloudStorage/<应用名>`，
+/// 由系统创建、初始为空，从不让用户选一个已有文件的目录；Linux 版直接把用户选的目录
+/// 当 FUSE 挂载点，挂载非空目录会被 fusermount 拒绝（`mountpoint is not empty`），
+/// 即使强行挂上也会把已有文件全部遮蔽。因此创建/开启按需同步前就拒绝，
+/// 避免出现“任务已写入库但启动失败、重试又提示重名/路径已共享”的半成品状态。
+pub fn validate_ondemand_pc_path(pc_path: &str) -> Result<()> {
+    use std::path::Path;
+    let raw = pc_path.trim();
+    if raw.is_empty() {
+        anyhow::bail!("按需同步需要选择电脑文件夹");
+    }
+    let p = Path::new(raw);
+    match std::fs::metadata(p) {
+        Ok(md) if md.is_dir() => {
+            let mut entries = std::fs::read_dir(p)
+                .with_context(|| format!("读取电脑文件夹失败：{}", p.display()))?;
+            if entries.next().is_some() {
+                anyhow::bail!(
+                    "按需同步要求电脑文件夹为空：{}（请清空该文件夹，或新建一个空文件夹后再选择）",
+                    p.display()
+                );
+            }
+            Ok(())
+        }
+        Ok(_) => anyhow::bail!("电脑路径不是文件夹：{}", p.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("检查电脑文件夹失败：{}", p.display())),
+    }
+}
+
+pub fn validate_app_name(name: &str) -> Result<()> {
+    if name.chars().count() > 32 {
+        anyhow::bail!("task.appNameTooLong");
+    }
+    if name.trim().is_empty() {
+        anyhow::bail!("task.checkNameFailed");
+    }
+    Ok(())
+}
+
+pub async fn add_task(pool: &SqlitePool, task: &TaskCreate) -> Result<i64> {
+    validate_app_name(&task.name)?;
+    if !VALID_MODES.contains(&task.mode.as_str()) {
+        anyhow::bail!("unsupported sync mode: {}", task.mode);
+    }
+    // 非双向模式下不允许按需同步，直接归一化为 0。
+    let open_cloud = if task.mode == ON_DEMAND_MODE {
+        task.open_cloud
+    } else {
+        0
+    };
+    if open_cloud == 1 {
+        validate_ondemand_pc_path(&task.pc_path)?;
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks")
+        .fetch_one(pool)
+        .await?;
+    if count >= MAX_TASKS {
+        anyhow::bail!("task.maxTasksReached");
+    }
+    let dup: Option<i64> = sqlx::query_scalar("SELECT id FROM tasks WHERE name = ?1")
+        .bind(&task.name)
+        .fetch_optional(pool)
+        .await?;
+    if dup.is_some() {
+        anyhow::bail!("task.nameExistsWithName");
+    }
+    let now = now_ms();
+    let next_id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) + 1 FROM tasks")
+        .fetch_one(pool)
+        .await?;
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO tasks (id, nas_acc_id, name, address, conn_type, uuid, identifier, mode, \
+         nas_path, pc_path, status, is_init_sync, open_cloud, created_at, updated_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) RETURNING id",
+    )
+    .bind(next_id)
+    .bind(task.nas_acc_id)
+    .bind(&task.name)
+    .bind(&task.address)
+    .bind(&task.conn_type)
+    .bind(&task.uuid)
+    .bind(&task.identifier)
+    .bind(&task.mode)
+    .bind(&task.nas_path)
+    .bind(&task.pc_path)
+    .bind(task.status)
+    .bind(task.is_init_sync)
+    .bind(open_cloud)
+    .bind(now)
+    .bind(now)
+    .fetch_one(pool)
+    .await
+    .context("insert task")?;
+
+    let rule = task.filter_rule.clone().unwrap_or_default();
+    sqlx::query(
+        "INSERT INTO task_filter_rules (task_id, ignore_dotfiles, enable_ignore_ext, \
+         ignore_extensions, enable_size_lower, size_lower_bound, enable_size_upper, \
+         size_upper_bound, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+    )
+    .bind(id)
+    .bind(rule.ignore_dotfiles)
+    .bind(rule.enable_ignore_ext)
+    .bind(rule.ignore_extensions.join(","))
+    .bind(rule.enable_size_lower)
+    .bind(rule.size_lower_bound)
+    .bind(rule.enable_size_upper)
+    .bind(rule.size_upper_bound)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+pub async fn get_all_tasks(pool: &SqlitePool) -> Result<Vec<Task>> {
+    let rows = sqlx::query_as::<_, Task>(
+        "SELECT id, nas_acc_id, name, address, conn_type, uuid, identifier, mode, nas_path, \
+         pc_path, status, is_init_sync, open_cloud, created_at, updated_at \
+         FROM tasks ORDER BY created_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn get_task_by_id(pool: &SqlitePool, id: i64) -> Result<Option<Task>> {
+    let row = sqlx::query_as::<_, Task>(
+        "SELECT id, nas_acc_id, name, address, conn_type, uuid, identifier, mode, nas_path, \
+         pc_path, status, is_init_sync, open_cloud, created_at, updated_at \
+         FROM tasks WHERE id = ?1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TaskUpdate {
+    pub filter_rule: Option<FilterRuleInput>,
+    pub name: Option<String>,
+    pub mode: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_integer")]
+    pub open_cloud: Option<i64>,
+}
+
+pub async fn update_task(pool: &SqlitePool, id: i64, upd: &TaskUpdate) -> Result<()> {
+    if let Some(name) = &upd.name {
+        validate_app_name(name)?;
+        let dup: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM tasks WHERE name = ?1 AND id != ?2")
+                .bind(name)
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+        if dup.is_some() {
+            anyhow::bail!("task.nameExistsWithName");
+        }
+    }
+    if let Some(mode) = &upd.mode {
+        if !VALID_MODES.contains(&mode.as_str()) {
+            anyhow::bail!("unsupported sync mode: {mode}");
+        }
+    }
+    // 取当前值以判断“最终”组合，避免只改其中一个字段就留下非法状态。
+    let current: Option<(String, i64, String)> =
+        sqlx::query_as("SELECT mode, open_cloud, pc_path FROM tasks WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((cur_mode, cur_open_cloud, cur_pc_path)) = current else {
+        anyhow::bail!("task not found");
+    };
+    let final_mode = upd.mode.clone().unwrap_or(cur_mode);
+    let final_open_cloud = if final_mode == ON_DEMAND_MODE {
+        upd.open_cloud.unwrap_or(cur_open_cloud)
+    } else {
+        0
+    };
+    // 只有“从关闭切到开启”才校验目录：已经挂载的按需同步任务里，
+    // 目录中是远端文件的占位视图（看起来非空），此时再校验会误报。
+    if final_open_cloud == 1 && cur_open_cloud == 0 {
+        validate_ondemand_pc_path(&cur_pc_path)?;
+    }
+    if let Some(rule) = &upd.filter_rule {
+        sqlx::query("UPDATE task_filter_rules SET ignore_dotfiles=?1, enable_ignore_ext=?2, ignore_extensions=?3, enable_size_lower=?4, size_lower_bound=?5, enable_size_upper=?6, size_upper_bound=?7, updated_at=?8 WHERE task_id=?9")
+            .bind(rule.ignore_dotfiles).bind(rule.enable_ignore_ext).bind(rule.ignore_extensions.join(","))
+            .bind(rule.enable_size_lower).bind(rule.size_lower_bound).bind(rule.enable_size_upper).bind(rule.size_upper_bound)
+            .bind(now_ms()).bind(id).execute(pool).await?;
+    }
+    sqlx::query(
+        "UPDATE tasks SET name = COALESCE(?1, name), mode = ?2, \
+         open_cloud = ?3, updated_at = ?4 WHERE id = ?5",
+    )
+    .bind(&upd.name)
+    .bind(&final_mode)
+    .bind(final_open_cloud)
+    .bind(now_ms())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn update_task_status(pool: &SqlitePool, id: i64, status: i64) -> Result<()> {
+    sqlx::query("UPDATE tasks SET status=?1, updated_at=?2 WHERE id=?3")
+        .bind(status)
+        .bind(now_ms())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_task(pool: &SqlitePool, id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM system_table WHERE key IN (?1,?2)")
+        .bind(format!("sync_snapshot_{id}"))
+        .bind(format!("folder_filter_paths_{id}"))
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM task_filter_rules WHERE task_id=?1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM tasks WHERE id=?1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn get_filter_rule_by_task_id(
+    pool: &SqlitePool,
+    task_id: i64,
+) -> Result<Option<FilterRuleInput>> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        ignore_dotfiles: i64,
+        enable_ignore_ext: i64,
+        ignore_extensions: Option<String>,
+        enable_size_lower: i64,
+        size_lower_bound: Option<i64>,
+        enable_size_upper: i64,
+        size_upper_bound: Option<i64>,
+    }
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT ignore_dotfiles, enable_ignore_ext, ignore_extensions, enable_size_lower, \
+         size_lower_bound, enable_size_upper, size_upper_bound \
+         FROM task_filter_rules WHERE task_id = ?1",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| FilterRuleInput {
+        ignore_dotfiles: r.ignore_dotfiles,
+        enable_ignore_ext: r.enable_ignore_ext,
+        ignore_extensions: r
+            .ignore_extensions
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        enable_size_lower: r.enable_size_lower,
+        size_lower_bound: r.size_lower_bound,
+        enable_size_upper: r.enable_size_upper,
+        size_upper_bound: r.size_upper_bound,
+    }))
+}
+
+pub async fn save_folder_filter_paths(
+    pool: &SqlitePool,
+    task_id: i64,
+    paths: &[String],
+) -> Result<()> {
+    // 官方把相对路径选择集存于 system_table（key = task 前缀）；沿用同一约定
+    let key = format!("folder_filter_paths_{task_id}");
+    let value = serde_json::to_string(paths)?;
+    sqlx::query(
+        "INSERT INTO system_table (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(&key)
+    .bind(&value)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_folder_filter_paths(pool: &SqlitePool, task_id: i64) -> Result<Vec<String>> {
+    let key = format!("folder_filter_paths_{task_id}");
+    let v: Option<String> = sqlx::query_scalar("SELECT value FROM system_table WHERE key = ?1")
+        .bind(&key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(v.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::database::{migrate, open_db};
+
+    async fn pool() -> (tempfile::TempDir, SqlitePool) {
+        let d = tempfile::tempdir().unwrap();
+        let p = open_db(&d.path().join("db.sqlite")).await.unwrap();
+        migrate(&p).await.unwrap();
+        (d, p)
+    }
+
+    fn task(name: &str, mode: &str) -> TaskCreate {
+        TaskCreate {
+            name: name.into(),
+            address: "192.168.1.10:5667".into(),
+            conn_type: "ip".into(),
+            uuid: "1700000000000".into(),
+            identifier: "tieren.SyncFile-admin-192.168.1.10:5667".into(),
+            mode: mode.into(),
+            nas_path: "/vol1/photos".into(),
+            pc_path: "/home/user/photos".into(),
+            status: 0,
+            nas_acc_id: 1,
+            is_init_sync: 0,
+            filter_rule: Some(FilterRuleInput::default_rule()),
+            open_cloud: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn add_task_with_default_filter() {
+        let (_d, p) = pool().await;
+        let id = add_task(&p, &task("photos", "bisynchronous"))
+            .await
+            .unwrap();
+        assert_eq!(id, 1);
+        let rule = get_filter_rule_by_task_id(&p, id).await.unwrap().unwrap();
+        assert_eq!(rule.ignore_dotfiles, 1);
+        assert_eq!(rule.ignore_extensions, vec!["lnk", "pst", "swp"]);
+        let t = get_task_by_id(&p, id).await.unwrap().unwrap();
+        assert_eq!(t.mode, "bisynchronous");
+    }
+
+    #[tokio::test]
+    async fn duplicate_name_rejected() {
+        let (_d, p) = pool().await;
+        add_task(&p, &task("a", "bisynchronous")).await.unwrap();
+        assert!(add_task(&p, &task("a", "uploadonly")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn name_too_long() {
+        let (_d, p) = pool().await;
+        let long = "x".repeat(33);
+        assert!(add_task(&p, &task(&long, "bisynchronous")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_mode_rejected() {
+        let (_d, p) = pool().await;
+        assert!(add_task(&p, &task("m", "bothway")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn update_and_delete() {
+        let (_d, p) = pool().await;
+        let id = add_task(&p, &task("t1", "bisynchronous")).await.unwrap();
+        update_task(
+            &p,
+            id,
+            &TaskUpdate {
+                filter_rule: None,
+                name: None,
+                mode: Some("uploadonly".into()),
+                open_cloud: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        let t = get_task_by_id(&p, id).await.unwrap().unwrap();
+        assert_eq!(t.mode, "uploadonly");
+        // 仅上传模式不允许按需同步，后端必须归一化为 0。
+        assert_eq!(t.open_cloud, 0);
+        update_task_status(&p, id, 4).await.unwrap();
+        assert_eq!(get_task_by_id(&p, id).await.unwrap().unwrap().status, 4);
+        delete_task(&p, id).await.unwrap();
+        assert!(get_task_by_id(&p, id).await.unwrap().is_none());
+    }
+
+    /// 按需同步只允许与双向同步组合；其它模式必须被归一化为 0。
+    #[tokio::test]
+    async fn on_demand_requires_bisynchronous_mode() {
+        let (_d, p) = pool().await;
+
+        // 创建时就非法 → 归一化
+        let mut t = task("od-bad", "uploadonly");
+        t.open_cloud = 1;
+        let id = add_task(&p, &t).await.unwrap();
+        assert_eq!(get_task_by_id(&p, id).await.unwrap().unwrap().open_cloud, 0);
+
+        // 双向同步可以开
+        let id2 = add_task(&p, &task("od-ok", "bisynchronous")).await.unwrap();
+        update_task(
+            &p,
+            id2,
+            &TaskUpdate {
+                filter_rule: None,
+                name: None,
+                mode: None,
+                open_cloud: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(get_task_by_id(&p, id2).await.unwrap().unwrap().open_cloud, 1);
+
+        // 切到仅下载 → 必须自动关闭
+        update_task(
+            &p,
+            id2,
+            &TaskUpdate {
+                filter_rule: None,
+                name: None,
+                mode: Some("downloadonly".into()),
+                open_cloud: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(get_task_by_id(&p, id2).await.unwrap().unwrap().open_cloud, 0);
+
+        // 仅改 open_cloud 但当前不是双向同步 → 依然拒绝生效
+        update_task(
+            &p,
+            id2,
+            &TaskUpdate {
+                filter_rule: None,
+                name: None,
+                mode: None,
+                open_cloud: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(get_task_by_id(&p, id2).await.unwrap().unwrap().open_cloud, 0);
+    }
+
+    #[tokio::test]
+    async fn folder_filter_paths_roundtrip() {
+        let (_d, p) = pool().await;
+        save_folder_filter_paths(&p, 1, &["sub".into(), "sub/deep".into()])
+            .await
+            .unwrap();
+        let v = get_folder_filter_paths(&p, 1).await.unwrap();
+        assert_eq!(v, vec!["sub", "sub/deep"]);
+    }
+
+    /// 按需同步的电脑目录必须为空：非空目录在创建时就拒绝，且不能留下半成品任务，
+    /// 否则前端提示创建失败、用户重试时会撞上“任务名已存在/该路径已被共享”。
+    #[tokio::test]
+    async fn on_demand_pc_path_must_be_empty() {
+        let (_d, p) = pool().await;
+        let dir = tempfile::tempdir().unwrap();
+
+        // 非空目录 → 拒绝创建，且库里不留任务
+        std::fs::write(dir.path().join("existing.txt"), b"x").unwrap();
+        let mut t = task("od-nonempty", "bisynchronous");
+        t.pc_path = dir.path().to_string_lossy().into_owned();
+        t.open_cloud = 1;
+        let err = add_task(&p, &t).await.unwrap_err().to_string();
+        assert!(err.contains("按需同步要求电脑文件夹为空"), "unexpected: {err}");
+        assert!(get_all_tasks(&p).await.unwrap().is_empty());
+
+        // 同一名字在清空目录后可以重新创建（不会撞重名）
+        std::fs::remove_file(dir.path().join("existing.txt")).unwrap();
+        let id = add_task(&p, &t).await.unwrap();
+        assert_eq!(get_task_by_id(&p, id).await.unwrap().unwrap().open_cloud, 1);
+
+        // 关闭按需后允许选非空目录（普通同步语义不变）
+        std::fs::write(dir.path().join("existing.txt"), b"x").unwrap();
+        let mut normal = task("normal-nonempty", "bisynchronous");
+        normal.pc_path = dir.path().to_string_lossy().into_owned();
+        add_task(&p, &normal).await.unwrap();
+    }
+
+    /// 编辑任务时开启按需同步：只有 0→1 才校验，已经在用的按需任务不会被自己拦下。
+    #[tokio::test]
+    async fn enabling_on_demand_later_requires_empty_path() {
+        let (_d, p) = pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("existing.txt"), b"x").unwrap();
+        let mut t = task("od-later", "bisynchronous");
+        t.pc_path = dir.path().to_string_lossy().into_owned();
+        let id = add_task(&p, &t).await.unwrap();
+
+        let enable = TaskUpdate {
+            filter_rule: None,
+            name: None,
+            mode: None,
+            open_cloud: Some(1),
+        };
+        let err = update_task(&p, id, &enable).await.unwrap_err().to_string();
+        assert!(err.contains("按需同步要求电脑文件夹为空"), "unexpected: {err}");
+        assert_eq!(get_task_by_id(&p, id).await.unwrap().unwrap().open_cloud, 0);
+
+        // 清空目录后可以开启
+        std::fs::remove_file(dir.path().join("existing.txt")).unwrap();
+        update_task(&p, id, &enable).await.unwrap();
+        assert_eq!(get_task_by_id(&p, id).await.unwrap().unwrap().open_cloud, 1);
+
+        // 已开启状态下再改其它字段不会因为挂载后的占位视图而误报
+        update_task(
+            &p,
+            id,
+            &TaskUpdate {
+                filter_rule: None,
+                name: Some("od-later-renamed".into()),
+                mode: None,
+                open_cloud: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get_task_by_id(&p, id).await.unwrap().unwrap().name,
+            "od-later-renamed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ipc_input_tests {
+    #[test]
+    fn accepts_official_ui_filter_payload() {
+        let input: super::FilterRuleInput = serde_json::from_value(serde_json::json!({
+            "ignore_extensions":"lnk,pst,swp", "size_lower_bound":"0", "size_upper_bound":"1048576"
+        }))
+        .unwrap();
+        assert_eq!(input.ignore_extensions, vec!["lnk", "pst", "swp"]);
+        assert_eq!(input.size_lower_bound, Some(0));
+        assert_eq!(input.size_upper_bound, Some(1048576));
+    }
+    #[test]
+    fn accepts_native_filter_payload_and_rejects_invalid_numbers() {
+        let input: super::FilterRuleInput = serde_json::from_value(serde_json::json!({
+            "ignore_extensions":["tmp"], "size_lower_bound":0, "size_upper_bound":null
+        }))
+        .unwrap();
+        assert_eq!(input.ignore_extensions, vec!["tmp"]);
+        assert_eq!(input.size_upper_bound, None);
+        assert!(serde_json::from_value::<super::FilterRuleInput>(
+            serde_json::json!({"size_lower_bound":"invalid"})
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod official_create_tests {
+    #[test]
+    fn full_task_create_and_update_payloads_accept_switches() {
+        let input = serde_json::json!({"name":"test", "address":"nas:5667", "conn_type":"ip",
+            "uuid":"123", "identifier":"test", "mode":"bisynchronous", "nas_path":"vol1/1000/test",
+            "pc_path":"/tmp/test", "status":0, "nas_acc_id":1, "is_init_sync":0, "open_cloud":true,
+            "filter_rule":{"ignore_dotfiles":1,"enable_ignore_ext":1,"ignore_extensions":"lnk,pst,swp",
+                "enable_size_lower":0,"size_lower_bound":"0","enable_size_upper":0,"size_upper_bound":"0"}});
+        let task: super::TaskCreate = serde_json::from_value(input).unwrap();
+        assert_eq!(task.open_cloud, 1);
+        let update: super::TaskUpdate =
+            serde_json::from_value(serde_json::json!({"open_cloud":false})).unwrap();
+        assert_eq!(update.open_cloud, Some(0));
+    }
+}
+
+#[cfg(test)]
+mod ui_roundtrip_tests {
+    #[test]
+    fn filter_rule_roundtrips_to_ui_string_fields() {
+        let rule = super::FilterRuleInput::default_rule();
+        let output = serde_json::to_value(rule).unwrap();
+        assert!(output["ignore_extensions"].is_string());
+        assert_eq!(
+            output["ignore_extensions"]
+                .as_str()
+                .unwrap()
+                .split(',')
+                .count(),
+            3
+        );
+    }
+    #[tokio::test]
+    async fn task_settings_update_mode_and_filter_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::service::database::open_db(&dir.path().join("db.sqlite"))
+            .await
+            .unwrap();
+        crate::service::database::migrate(&db).await.unwrap();
+        let create: super::TaskCreate = serde_json::from_value(serde_json::json!({"name":"settings", "address":"test", "conn_type":"ip", "uuid":"1", "identifier":"qa", "mode":"bisynchronous", "nas_path":"vol1/1/test", "pc_path":"/tmp/test", "nas_acc_id":0,"open_cloud":false})).unwrap();
+        let id = super::add_task(&db, &create).await.unwrap();
+        let edit:super::TaskUpdate=serde_json::from_value(serde_json::json!({"mode":"downloadonly","filter_rule":{"ignore_extensions":"tmp,bak", "size_lower_bound":"10"},"open_cloud":false})).unwrap();
+        super::update_task(&db, id, &edit).await.unwrap();
+        assert_eq!(
+            super::get_task_by_id(&db, id).await.unwrap().unwrap().mode,
+            "downloadonly"
+        );
+        let rule = super::get_filter_rule_by_task_id(&db, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rule.ignore_extensions, vec!["tmp", "bak"]);
+        assert_eq!(rule.size_lower_bound, Some(10));
+        super::delete_task(&db, id).await.unwrap();
+        assert!(super::get_task_by_id(&db, id).await.unwrap().is_none());
+    }
+}

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <title>Fn Sync Client</title>
+    <!-- Tauri1 桥接层：官方 bundle 按 Tauri2 运行时打包，此脚本同步注入 v2 兼容接口（非业务逻辑） -->
+    <script src="tauri1-shim.js"></script>
+    <script>
+      const brand = 'cn';
+      document.title = brand === 'global' ? 'FygoSync' : '飞牛同步';
+    </script>
+    <style>
+      html,
+      body {
+        background: transparent;
+        padding: 0;
+        margin: 0;
+        outline: 0;
+        overflow: hidden !important;
+        box-sizing: border-box;
+				-webkit-transform: translateZ(0);
+  			-webkit-font-smoothing: antialiased;
+      }
+
+      body {
+        height: 100vh;
+        width: 100vw;
+      }
+    </style>
+    <script type="module" crossorigin src="/assets/index-j0OzAfN8.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-D7bMY7MM.css">
+  </head>
+
+  <body>
+    <div class="overflow-hidden" id="root"></div>
+    <script>
+      const mql = window.matchMedia('(prefers-color-scheme: dark)');
+
+      function matchMode(e) {
+        const body = document.body;
+        if (e.matches) {
+          if (!body.hasAttribute('theme-mode')) {
+            body.setAttribute('theme-mode', 'dark');
+          }
+        } else {
+          if (body.hasAttribute('theme-mode')) {
+            body.removeAttribute('theme-mode');
+          }
+        }
+      }
+
+      // 在页面加载时立即检查当前的系统颜色模式
+      matchMode(mql);
+
+      mql.addListener(matchMode);
+    </script>
+    <script>
+      async function detectWindows10() {
+        let isWindows10 = false;
+
+        if (navigator.userAgentData && navigator.userAgentData.getHighEntropyValues) {
+          try {
+            const ua = await navigator.userAgentData.getHighEntropyValues(['platformVersion']);
+
+            if (navigator.userAgentData.platform === 'Windows') {
+              const platformVersion = ua.platformVersion;
+              const majorVersion = parseInt(platformVersion.split('.')[0]);
+              if (majorVersion >= 1 && majorVersion <= 12) {
+                isWindows10 = true;
+              }
+            }
+          } catch (error) {
+            isWindows10 = checkUserAgentFallback();
+          }
+        }
+
+        if (isWindows10) {
+          const rootDiv = document.getElementById('root');
+          if (rootDiv) {
+            rootDiv.classList.add('border-t-[0.5px]', 'border-black', 'border-solid');
+            console.log('已应用Windows 10样式');
+          }
+        }
+      }
+
+      detectWindows10();
+    </script>
+  </body>
+</html>

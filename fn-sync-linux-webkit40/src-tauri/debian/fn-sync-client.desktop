@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=飞牛同步
+Name[en]=FN Sync
+Comment=飞牛同步 Linux 客户端 — 与 fnOS NAS 同步服务互通的文件同步工具
+Exec=fn-sync-client
+Icon=fn-sync-client
+Type=Application
+Categories=Utility;Network;FileTransfer;
+StartupWMClass=飞牛同步
+Terminal=false

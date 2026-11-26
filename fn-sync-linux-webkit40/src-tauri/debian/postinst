@@ -1,0 +1,30 @@
+#!/bin/sh
+# 文件管理器插件（Peony / DDE）由 deb 直接装进各自的插件扫描目录，这里只做
+# 图标缓存刷新和安装提示。
+#
+# 为什么不软链：DDE 的扩展扫描器不加载软链形式的 .so（实测），Peony 虽然可以，
+# 但两边统一成真实文件更省事；插件文件归属 dpkg，卸载时自动删除。
+set -e
+
+FOUND=0
+for f in /usr/lib/*-linux-gnu*/peony-extensions/libfnsync-peony-menu.so \
+         /usr/lib/*-linux-gnu*/dde-file-manager/plugins/extensions/libfnsync-dde.so; do
+    # 注意不能写成 `[ -e "$f" ] && FOUND=1`：set -e 下第一个未命中的路径
+    # 会让脚本直接退出（之前 DDE 包因此没打印安装提示、也没刷新图标缓存）。
+    if [ -e "$f" ]; then
+        FOUND=1
+    fi
+done
+
+# 刷新图标缓存，让已在运行的文件管理器也能取到 emblem-fnsync-* 角标图标。
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
+fi
+
+if [ "$FOUND" = 1 ]; then
+    echo "飞牛同步：已安装文件管理器插件，重新登录或重启文件管理器后生效。"
+fi
+
+#DEBHELPER#
+
+exit 0
