@@ -20,6 +20,11 @@
 
 各版本的详细设计、构建依赖与验证记录见各自目录下的 `README.md`。
 
+## 下载
+
+预构建安装包见 [Releases](https://github.com/xmlijian/fn-sync-linux-unofficial/releases)，
+包含 deb 与 AppImage，附 `SHA256SUMS.txt` 校验文件。
+
 ## 两份代码的关系
 
 业务代码同源，差异只在框架胶水和平台集成：
