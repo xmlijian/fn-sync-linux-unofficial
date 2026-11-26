@@ -1,0 +1,34 @@
+#!/bin/sh
+# 升级/卸载前清理早期版本用维护者脚本创建、不归 dpkg 管的插件软链/拷贝。
+# （现在插件已直接作为 deb 文件安装，dpkg 会自行删除。）
+set -e
+
+LEGACY_DIRS="/usr/lib/fn-sync-client/peony /usr/lib/fn-sync-client/dde"
+
+for dir in /usr/lib/*-linux-gnu*/peony-extensions; do
+    [ -d "$dir" ] || continue
+    for name in libfnsync-peony-menu.so libfnsync-peony-emblem.so; do
+        target=$dir/$name
+        [ -L "$target" ] || continue
+        for legacy in $LEGACY_DIRS; do
+            case "$(readlink "$target")" in
+                "$legacy"/*) rm -f "$target" ;;
+            esac
+        done
+    done
+done
+
+for dir in /usr/lib/*-linux-gnu*/dde-file-manager/plugins/extensions; do
+    [ -d "$dir" ] || continue
+    target=$dir/libfnsync-dde.so
+    [ -L "$target" ] || continue
+    for legacy in $LEGACY_DIRS; do
+        case "$(readlink "$target")" in
+            "$legacy"/*) rm -f "$target" ;;
+        esac
+    done
+done
+
+#DEBHELPER#
+
+exit 0

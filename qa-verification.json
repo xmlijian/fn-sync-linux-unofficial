@@ -1,0 +1,128 @@
+{
+  "date": "2026-11-21",
+  "scope": "Linux ordinary sync and existing UI/backend contracts",
+  "result": "passed for tested scope",
+  "checks": {
+    "ipc_static": {
+      "calls": 82,
+      "commands": 89,
+      "result": "pass"
+    },
+    "unit_and_actual_tauri_ipc": {
+      "passed": 59,
+      "failed": 0,
+      "live_tests_excluded_from_unit_run": 7
+    },
+    "live_nas": {
+      "passed": 5,
+      "failed": 0,
+      "isolated_test_directory_removed": true
+    },
+    "ui_rendering": {
+      "result": "pass",
+      "uses": "shipped UI and response fixtures from real Tauri IPC tests",
+      "scenarios": [
+        "task list",
+        "task settings modal",
+        "filter rules tab",
+        "selective sync tab",
+        "log page with entries",
+        "application settings page",
+        "settings export save path and unsupported update dialog",
+        "pause/resume state refresh"
+      ],
+      "page_exceptions": 0
+    },
+    "ui_invoke_bridge": {
+      "result": "pass",
+      "coverage": [
+        "mDNS app command routing",
+        "immutable Tauri object",
+        "other plugin passthrough",
+        "rejected command logging without argument values"
+      ]
+    },
+    "destination_session_refresh": {
+      "result": "pass",
+      "address": "nas.example.com:5667",
+      "writes": "verified renewed access token saved to local account database"
+    },
+    "real_saved_logs": {
+      "result": "pass",
+      "records": 67,
+      "first_page": 25,
+      "exported_records": 67,
+      "request_dates": [
+        "empty strings",
+        "millisecond strings"
+      ],
+      "test_writes": "temporary archive only; existing database read-only"
+    },
+    "settings_behavior": {
+      "result": "pass",
+      "coverage": [
+        "speed settings apply to running transfers without restart",
+        "log retention applies immediately and periodically",
+        "zero retention values mean unlimited",
+        "gzip export contains sync-logs.jsonl and runtime logs",
+        "export path selection, success and failure feedback",
+        "manual check update explicitly unsupported; automatic update disabled",
+        "autostart file test isolated from user configuration"
+      ]
+    },
+    "pause_inflight": {
+      "result": "pass",
+      "modes": [
+        "uploadonly",
+        "downloadonly"
+      ],
+      "file_bytes": 131072,
+      "rate_kib_per_second": 64,
+      "pause_during_transfer_after_ms": 1300,
+      "pause_completed_within_seconds": 1,
+      "post_pause_observation_ms": 1500,
+      "resume_content_verified": true,
+      "lifecycle_regression": "pass",
+      "cleanup": "isolated NAS directory removed",
+      "normal_transfer_duration_seconds": 2,
+      "post_pause_observation_exceeds_normal_completion": true
+    }
+  },
+  "live_coverage": [
+    "saved OAuth session and reconnect",
+    "upload/download content equality and bandwidth limits",
+    "Unicode filenames",
+    "rename and deletion completion",
+    "bidirectional, upload-only, download-only",
+    "one-way destination retention on source deletion",
+    "existing and nested files",
+    "directory exclusions",
+    "directory/extension/size filter changes retain existing files",
+    "local modification preserving mtime",
+    "same-size same-time NAS upload update",
+    "conflict copy before replacement",
+    "local delete versus newer NAS edit",
+    "pause/resume",
+    "stop and executor recreation",
+    "offline local deletion after snapshot restore",
+    "real socket disconnect and automatic reconnect",
+    "reject destination and staging-directory symlinks",
+    "expired access token renewal through long token, authenticated verification, and database persistence",
+    "pause cancels active HTTP uploads/downloads; paused status is retained and resume rechecks files"
+  ],
+  "unsupported_or_not_exercised": [
+    "Linux on-demand placeholders are unsupported and disabled; ordinary sync is used",
+    "system login/reboot and autostart launch not exercised",
+    "FN Connect relay/fnid resolves through the connect endpoint; P2P hole punching not implemented",
+    "Kylin 2303/2403/3503, UOS1070 and ARM/LoongArch require native build/runtime validation",
+    "LAN mDNS device discovery on target customer networks not exercised; IPC routing tested",
+    "Checking/installing updates intentionally unsupported per user request; UI reports unsupported"
+  ],
+  "safety_bounds": "Only dedicated fn-sync-qa NAS directories and temporary local files were modified by live tests; normal task files were not used as test fixtures",
+  "reproduce": {
+    "static": "node scripts/check-ipc-contracts.cjs",
+    "unit": "GIT_HASH=qa cargo test --manifest-path src-tauri/Cargo.toml --lib",
+    "live": "Set FN_SYNC_TEST_DB, FN_SYNC_TEST_ADDRESS, FN_SYNC_TEST_REMOTE_ROOT to a dedicated fn-sync-qa directory; cargo test --lib -- --ignored --nocapture",
+    "ui": "Generate FN_SYNC_UI_FIXTURES via ui_task_creation_settings_logs_and_deletion_contracts, then node scripts/qa-ui-smoke.cjs"
+  }
+}
