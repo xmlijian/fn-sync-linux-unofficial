@@ -61,21 +61,30 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>) -> Result<()> {
     let read = BufReader::new(read).take(8193);
     let mut read = BufReader::new(read);
     tokio::time::timeout(Duration::from_secs(2), read.read_line(&mut line)).await??;
-    let response = if line.len() > 8192 {
-        json!({"ok":false,"error":"request too large"})
-    } else {
-        match serde_json::from_str::<Request>(&line) {
-            Ok(request) => {
-                match tokio::time::timeout(Duration::from_secs(60), handle(&shared, request))
-                    .await
-                    .unwrap_or_else(|_| Err(anyhow!("控制操作超时")))
-                {
-                    Ok(value) => json!({"ok":true,"result":value}),
-                    Err(error) => json!({"ok":false,"error":error.to_string()}),
-                }
-            }
-            Err(error) => json!({"ok":false,"error":error.to_string()}),
+    if line.len() > 8192 {
+        let _ = write
+            .write_all(b"{\"ok\":false,\"error\":\"request too large\"}\n")
+            .await;
+        return Ok(());
+    }
+    let request = match serde_json::from_str::<Request>(&line) {
+        Ok(request) => request,
+        Err(error) => {
+            let body = json!({"ok":false,"error":error.to_string()});
+            let _ = write.write_all(format!("{body}\n").as_bytes()).await;
+            return Ok(());
         }
+    };
+    // 长连接订阅：文件管理器扩展用来即时刷新角标，不占用控制操作配额。
+    if request.action == "subscribe" {
+        return serve_subscribe(&shared, &mut write).await;
+    }
+    let response = match tokio::time::timeout(Duration::from_secs(60), handle(&shared, request))
+        .await
+        .unwrap_or_else(|_| Err(anyhow!("控制操作超时")))
+    {
+        Ok(value) => json!({"ok":true,"result":value}),
+        Err(error) => json!({"ok":false,"error":error.to_string()}),
     };
     tokio::time::timeout(
         Duration::from_secs(2),
@@ -85,24 +94,86 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>) -> Result<()> {
     Ok(())
 }
 
+/// 长连接状态订阅：先回 ack，之后每次状态变化推一行事件。
+/// 连接断开或写失败即退出；Nautilus 扩展会自行重连。
+async fn serve_subscribe(
+    shared: &Arc<Shared>,
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+) -> Result<()> {
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        write.write_all(b"{\"ok\":true,\"result\":{\"subscribed\":true}}\n"),
+    )
+    .await??;
+    let mut rx = shared.state_tx.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+        let sent = tokio::time::timeout(
+            Duration::from_secs(2),
+            write.write_all(b"{\"event\":\"state\"}\n"),
+        )
+        .await;
+        if !matches!(sent, Ok(Ok(()))) {
+            break;
+        }
+        let flushed = tokio::time::timeout(Duration::from_secs(2), write.flush()).await;
+        if !matches!(flushed, Ok(Ok(()))) {
+            break;
+        }
+    }
+    Ok(())
+}
+
 async fn resolve(shared: &Shared, rel: &str) -> Result<u64> {
     let mut ino = ROOT_INO;
+    let mut prefix = String::new();
     for component in rel.split('/').filter(|c| !c.is_empty()) {
-        ino = shared
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+        let mut child = shared
             .resolve_child(ino, std::ffi::OsStr::new(component))
-            .await?
-            .ok_or_else(|| anyhow!("文件不存在"))?;
+            .await?;
+        if child.is_none() {
+            // 目录缓存（TTL 5s）可能落后于用户在别处的创建/改名。
+            // 强制刷新一次再解析，避免“刷新一下再操作才行”。
+            shared.invalidate_parent_listing(ino);
+            child = shared
+                .resolve_child(ino, std::ffi::OsStr::new(component))
+                .await?;
+        }
+        if child.is_none() {
+            // 远端列表暂时没有，但守护进程仍持有该 inode（例如刚被远端删除、
+            // 清理尚未完成）。允许释放等操作继续，避免本地缓存无法释放。
+            if let Some(stale) = shared.ino_by_rel.get(&prefix).map(|v| *v) {
+                ino = stale;
+                continue;
+            }
+        }
+        ino = child.ok_or_else(|| anyhow!("文件不存在"))?;
     }
     Ok(ino)
 }
 
 pub fn snapshot(shared: &Shared) -> Value {
+    // 同一路径只输出一条：历史版本可能留下孤儿 inode（`inodes` 有、
+    // `ino_by_rel` 无），重复条目会让文件管理器反复刷新同一个角标。
+    let mut seen = std::collections::HashSet::new();
     let files: Vec<Value> = shared
         .inodes
         .iter()
         .filter_map(|entry| {
             let node = entry.try_read()?;
-            if node.rel.is_empty() {
+            // 回收站等本机保留名只存在于挂载内，不属于同步条目：不能出现在
+            // 状态/批量操作里，否则“下载整个目录”会把回收站内容也入队。
+            if node.rel.is_empty()
+                || Shared::is_local_only(&node.rel)
+                || !seen.insert(node.rel.clone())
+            {
                 return None;
             }
             let transfer = shared.transfers.get(&node.rel);
@@ -159,7 +230,12 @@ async fn handle(shared: &Arc<Shared>, request: Request) -> Result<Value> {
                 .read()
                 .clone();
             if node.kind != fuser::FileType::Directory {
-                files.push(node.rel);
+                if !Shared::is_local_only(&node.rel) {
+                    files.push(node.rel);
+                }
+                continue;
+            }
+            if Shared::is_local_only(&node.rel) {
                 continue;
             }
             for entry in shared.list_dir(ino).await? {
@@ -198,6 +274,8 @@ async fn handle(shared: &Arc<Shared>, request: Request) -> Result<Value> {
             // 必须能通过状态暴露给 CLI（通知横幅可能被系统关闭）。
             shared.releasing.insert(rel.clone(), ());
             shared.errors.remove(&rel);
+            // 立即推「释放中」状态，角标/菜单不等下一次轮询。
+            shared.notify_inode(ino);
             let s = shared.clone();
             let name = rel.clone();
             if !shared.transfer_ops.submit(
@@ -231,6 +309,8 @@ async fn handle(shared: &Arc<Shared>, request: Request) -> Result<Value> {
             }
             shared.errors.remove(&rel);
             shared.queued_downloads.insert(rel.clone(), ());
+            // 立即推「等待下载」状态。
+            shared.notify_inode(ino);
             let s = shared.clone();
             let name = rel.clone();
             if !shared.transfer_ops.submit(
@@ -475,6 +555,38 @@ mod integration_tests {
                 .len(),
             0
         );
+    }
+
+    /// 订阅连接：先收到 ack，之后任意状态变化应推送一行事件。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn socket_subscribe_pushes_state_events() {
+        let (_tmp, shared) = fixture().await;
+        start(shared.clone()).unwrap();
+
+        let mut stream = UnixStream::connect(shared.cache.root().join("control.sock"))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"{\"action\":\"subscribe\"}\n")
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(line.contains("subscribed"), "ack: {line}");
+
+        // pin 会触发 set_pin → notify_inode → state_tx 广播
+        assert_eq!(rpc(&shared, "pin", "a.txt").await["ok"], true);
+        line.clear();
+        let n = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(n > 0, "expected a state event line");
+        assert!(line.contains("event"), "event: {line}");
     }
 }
 

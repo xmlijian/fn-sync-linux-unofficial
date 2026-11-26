@@ -110,6 +110,17 @@ JSON-v1 动作（serde 恢复，tuple variants）:
 { "req": "file.mkdir",   "reqid": "...", ... }
 ```
 响应: `{ "files": [ { name, dir, v(olume), size, ... } ] }`
+
+`file.ls` / `file.lsDir` 实测（fnOS 0.20.12 / trim 1.2.1010）**回两帧、reqid 相同**：
+```
+{ "files": [...], "uver": <n>, "reqid": "<id>" }   ← 数据帧（先到）
+{ "uver": <n>, "reqid": "<id>", "result": "succ" } ← 确认帧（后到，无 files）
+```
+客户端必须按 reqid 等待含 `files` 的数据帧；确认帧不是目录内容。
+若把确认帧当成回包，会把目录解析成**空目录**（进而误删/误清缓存）。
+`file.download` 以含 `download` 的帧为准（也可能与结果确认帧分开到达，见 14.5）。
+只有 `user.login`（`encrypted` 信封）的成功回包不回显 reqid。
+
 团队目录路径: `vol{v}/@team/{name}`。
 reqid 生成: `hex(unix_ts,8) + hex(counter,4) + "0000000000000000"`。
 

@@ -70,6 +70,9 @@ fn ui_task_creation_settings_logs_and_deletion_contracts() {
         .unwrap();
     let local = temp.path().join("local");
     std::fs::create_dir_all(local.join("中文目录")).unwrap();
+    // 按需同步（open_cloud）要求电脑目录为空；普通同步的 local 目录故意是有内容的。
+    let mount = temp.path().join("mount");
+    std::fs::create_dir_all(&mount).unwrap();
     assert_eq!(
         invoke(&window, "is_path_sync_root_command", json!({"path":local})),
         false
@@ -80,7 +83,7 @@ fn ui_task_creation_settings_logs_and_deletion_contracts() {
     );
     let id=invoke(&window,"add_task",json!({"task":{
         "name":"UI task","address":"test","conn_type":"ip","uuid":"1","identifier":"qa",
-        "mode":"bisynchronous","nas_path":"vol1/1000/test","pc_path":local,"nas_acc_id":0,"open_cloud":true,
+        "mode":"bisynchronous","nas_path":"vol1/1000/test","pc_path":mount,"nas_acc_id":0,"open_cloud":true,
         "filter_rule":{"ignore_dotfiles":1,"enable_ignore_ext":1,"ignore_extensions":"lnk,pst,swp",
             "enable_size_lower":0,"size_lower_bound":"0","enable_size_upper":0,"size_upper_bound":"0"}
     }})).as_i64().unwrap();

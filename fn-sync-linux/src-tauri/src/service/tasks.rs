@@ -153,6 +153,38 @@ pub const VALID_MODES: &[&str] = &["bisynchronous", "uploadonly", "downloadonly"
 /// 非法组合，而挂载一旦建立就完全忽略 mode —— 表现为“仅上传”的任务却会下载。
 pub const ON_DEMAND_MODE: &str = "bisynchronous";
 
+/// 按需同步的电脑目录必须为空（不存在会自动创建）。
+///
+/// 官方 macOS 客户端用 FileProvider，同步目录固定在 `~/Library/CloudStorage/<应用名>`，
+/// 由系统创建、初始为空，从不让用户选一个已有文件的目录；Linux 版直接把用户选的目录
+/// 当 FUSE 挂载点，挂载非空目录会被 fusermount 拒绝（`mountpoint is not empty`），
+/// 即使强行挂上也会把已有文件全部遮蔽。因此创建/开启按需同步前就拒绝，
+/// 避免出现“任务已写入库但启动失败、重试又提示重名/路径已共享”的半成品状态。
+pub fn validate_ondemand_pc_path(pc_path: &str) -> Result<()> {
+    use std::path::Path;
+    let raw = pc_path.trim();
+    if raw.is_empty() {
+        anyhow::bail!("按需同步需要选择电脑文件夹");
+    }
+    let p = Path::new(raw);
+    match std::fs::metadata(p) {
+        Ok(md) if md.is_dir() => {
+            let mut entries = std::fs::read_dir(p)
+                .with_context(|| format!("读取电脑文件夹失败：{}", p.display()))?;
+            if entries.next().is_some() {
+                anyhow::bail!(
+                    "按需同步要求电脑文件夹为空：{}（请清空该文件夹，或新建一个空文件夹后再选择）",
+                    p.display()
+                );
+            }
+            Ok(())
+        }
+        Ok(_) => anyhow::bail!("电脑路径不是文件夹：{}", p.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("检查电脑文件夹失败：{}", p.display())),
+    }
+}
+
 pub fn validate_app_name(name: &str) -> Result<()> {
     if name.chars().count() > 32 {
         anyhow::bail!("task.appNameTooLong");
@@ -174,6 +206,9 @@ pub async fn add_task(pool: &SqlitePool, task: &TaskCreate) -> Result<i64> {
     } else {
         0
     };
+    if open_cloud == 1 {
+        validate_ondemand_pc_path(&task.pc_path)?;
+    }
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks")
         .fetch_one(pool)
         .await?;
@@ -287,12 +322,12 @@ pub async fn update_task(pool: &SqlitePool, id: i64, upd: &TaskUpdate) -> Result
         }
     }
     // 取当前值以判断“最终”组合，避免只改其中一个字段就留下非法状态。
-    let current: Option<(String, i64)> =
-        sqlx::query_as("SELECT mode, open_cloud FROM tasks WHERE id = ?1")
+    let current: Option<(String, i64, String)> =
+        sqlx::query_as("SELECT mode, open_cloud, pc_path FROM tasks WHERE id = ?1")
             .bind(id)
             .fetch_optional(pool)
             .await?;
-    let Some((cur_mode, cur_open_cloud)) = current else {
+    let Some((cur_mode, cur_open_cloud, cur_pc_path)) = current else {
         anyhow::bail!("task not found");
     };
     let final_mode = upd.mode.clone().unwrap_or(cur_mode);
@@ -301,6 +336,11 @@ pub async fn update_task(pool: &SqlitePool, id: i64, upd: &TaskUpdate) -> Result
     } else {
         0
     };
+    // 只有“从关闭切到开启”才校验目录：已经挂载的按需同步任务里，
+    // 目录中是远端文件的占位视图（看起来非空），此时再校验会误报。
+    if final_open_cloud == 1 && cur_open_cloud == 0 {
+        validate_ondemand_pc_path(&cur_pc_path)?;
+    }
     if let Some(rule) = &upd.filter_rule {
         sqlx::query("UPDATE task_filter_rules SET ignore_dotfiles=?1, enable_ignore_ext=?2, ignore_extensions=?3, enable_size_lower=?4, size_lower_bound=?5, enable_size_upper=?6, size_upper_bound=?7, updated_at=?8 WHERE task_id=?9")
             .bind(rule.ignore_dotfiles).bind(rule.enable_ignore_ext).bind(rule.ignore_extensions.join(","))
@@ -572,6 +612,78 @@ mod tests {
             .unwrap();
         let v = get_folder_filter_paths(&p, 1).await.unwrap();
         assert_eq!(v, vec!["sub", "sub/deep"]);
+    }
+
+    /// 按需同步的电脑目录必须为空：非空目录在创建时就拒绝，且不能留下半成品任务，
+    /// 否则前端提示创建失败、用户重试时会撞上“任务名已存在/该路径已被共享”。
+    #[tokio::test]
+    async fn on_demand_pc_path_must_be_empty() {
+        let (_d, p) = pool().await;
+        let dir = tempfile::tempdir().unwrap();
+
+        // 非空目录 → 拒绝创建，且库里不留任务
+        std::fs::write(dir.path().join("existing.txt"), b"x").unwrap();
+        let mut t = task("od-nonempty", "bisynchronous");
+        t.pc_path = dir.path().to_string_lossy().into_owned();
+        t.open_cloud = 1;
+        let err = add_task(&p, &t).await.unwrap_err().to_string();
+        assert!(err.contains("按需同步要求电脑文件夹为空"), "unexpected: {err}");
+        assert!(get_all_tasks(&p).await.unwrap().is_empty());
+
+        // 同一名字在清空目录后可以重新创建（不会撞重名）
+        std::fs::remove_file(dir.path().join("existing.txt")).unwrap();
+        let id = add_task(&p, &t).await.unwrap();
+        assert_eq!(get_task_by_id(&p, id).await.unwrap().unwrap().open_cloud, 1);
+
+        // 关闭按需后允许选非空目录（普通同步语义不变）
+        std::fs::write(dir.path().join("existing.txt"), b"x").unwrap();
+        let mut normal = task("normal-nonempty", "bisynchronous");
+        normal.pc_path = dir.path().to_string_lossy().into_owned();
+        add_task(&p, &normal).await.unwrap();
+    }
+
+    /// 编辑任务时开启按需同步：只有 0→1 才校验，已经在用的按需任务不会被自己拦下。
+    #[tokio::test]
+    async fn enabling_on_demand_later_requires_empty_path() {
+        let (_d, p) = pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("existing.txt"), b"x").unwrap();
+        let mut t = task("od-later", "bisynchronous");
+        t.pc_path = dir.path().to_string_lossy().into_owned();
+        let id = add_task(&p, &t).await.unwrap();
+
+        let enable = TaskUpdate {
+            filter_rule: None,
+            name: None,
+            mode: None,
+            open_cloud: Some(1),
+        };
+        let err = update_task(&p, id, &enable).await.unwrap_err().to_string();
+        assert!(err.contains("按需同步要求电脑文件夹为空"), "unexpected: {err}");
+        assert_eq!(get_task_by_id(&p, id).await.unwrap().unwrap().open_cloud, 0);
+
+        // 清空目录后可以开启
+        std::fs::remove_file(dir.path().join("existing.txt")).unwrap();
+        update_task(&p, id, &enable).await.unwrap();
+        assert_eq!(get_task_by_id(&p, id).await.unwrap().unwrap().open_cloud, 1);
+
+        // 已开启状态下再改其它字段不会因为挂载后的占位视图而误报
+        update_task(
+            &p,
+            id,
+            &TaskUpdate {
+                filter_rule: None,
+                name: Some("od-later-renamed".into()),
+                mode: None,
+                open_cloud: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get_task_by_id(&p, id).await.unwrap().unwrap().name,
+            "od-later-renamed"
+        );
     }
 }
 

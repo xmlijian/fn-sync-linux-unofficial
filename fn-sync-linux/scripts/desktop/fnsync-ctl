@@ -206,23 +206,6 @@ class ProgressDialog:
         self._zenity = None
 
 
-def finish_info(message):
-    """完成提示：通知可用就走通知；否则 GUI 入口弹 3 秒自动关闭的提示窗。"""
-    if notifications_enabled():
-        notify("操作完成", message)
-        return
-    if _gui_env():
-        try:
-            subprocess.run(
-                ["zenity", "--info", "--title=飞牛同步", "--timeout=3", f"--text={message}"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6,
-            )
-            return
-        except (OSError, subprocess.SubprocessError):
-            pass
-    notify("操作完成", message)
-
-
 def report_errors(errors):
     if not errors:
         return
@@ -248,11 +231,15 @@ def request_retry(sock, action, path="", timeout=30, retries=50):
         try:
             return request(sock, action, path, timeout=timeout)
         except RuntimeError as error:
-            if "控制操作繁忙" in str(error) or "传输队列已满" in str(error):
-                time.sleep(0.1)
+            text = str(error)
+            if any(
+                k in text
+                for k in ("控制操作繁忙", "传输队列已满", "文件正在", "正在被使用", "稍后再试")
+            ):
+                time.sleep(0.15)
                 continue
             raise
-    raise RuntimeError("控制操作繁忙或传输队列已满，请稍后重试")
+    raise RuntimeError("控制操作繁忙或文件正在传输，请稍后重试")
 
 
 def fetch_states(sock):
@@ -312,6 +299,7 @@ def download_files(sock, action, files):
                 active.add(name)
 
         submit_next()
+        retries = {}
         while active or pending:
             states = fetch_states(sock)
             agg_speed = 0
@@ -327,7 +315,23 @@ def download_files(sock, action, files):
                     done += 1
                     continue
                 if st.get("error"):
-                    errors.append(f"{name}: {st['error']}")
+                    err = str(st["error"])
+                    transient = any(
+                        k in err for k in ("超时", "连接", "稍后", "暂时", "网络")
+                    )
+                    if transient and retries.get(name, 0) < 2:
+                        retries[name] = retries.get(name, 0) + 1
+                        active.discard(name)
+                        time.sleep(0.5)
+                        try:
+                            # download/pin 会清掉旧错误并重新入队
+                            request_retry(sock, action, name, timeout=30, retries=200)
+                            active.add(name)
+                        except (OSError, RuntimeError) as retry_error:
+                            errors.append(f"{name}: {retry_error}")
+                            done += 1
+                        continue
+                    errors.append(f"{name}: {err}")
                     active.discard(name)
                     done += 1
                     continue
@@ -421,24 +425,29 @@ def free_files(sock, files, bulk=False):
             skipped["pinned"] += 1
             if not bulk:
                 errors.append(f"{name}: 已设为“始终保留在此电脑”，请先取消保留")
-        elif state == "dirty":
-            skipped["dirty"] += 1
-            if not bulk:
-                errors.append(f"{name}: 文件有未上传的本地修改，不能释放")
         elif state == "placeholder":
             skipped["placeholder"] += 1
         elif state in ("cached", "releasing"):
             pending.append(name)
+        elif state == "dirty":
+            if bulk:
+                skipped["dirty"] += 1
+            else:
+                # 等本地修改上传完成后再释放；由下面的瞬时错误重试处理
+                pending.append(name)
         else:
-            skipped["active"] += 1
-            if not bulk:
-                errors.append(f"{name}: 文件正在传输，稍后再试")
+            if bulk:
+                skipped["active"] += 1
+            else:
+                # 可能正在下载/上传；交给瞬时错误重试
+                pending.append(name)
     if not pending:
         return errors, 0, skipped
 
     released = 0
     active = set()
-    deadline = time.time() + min(600.0, max(60.0, len(pending) * 2.0))
+    retries = {}
+    deadline = time.time() + min(600.0, max(60.0, len(pending) * 2.0) + 10.0)
 
     def submit_next():
         # 传输池队列容量 128；这里分批提交，避免一次压满队列。
@@ -467,7 +476,22 @@ def free_files(sock, files, bulk=False):
                 active.discard(name)
                 continue
             if st.get("error"):
-                errors.append(f"{name}: {st['error']}")
+                err = str(st["error"])
+                transient = any(
+                    k in err for k in ("本地修改", "正在传输", "正在被使用", "稍后再试")
+                )
+                if not bulk and transient and retries.get(name, 0) < 5:
+                    retries[name] = retries.get(name, 0) + 1
+                    active.discard(name)
+                    time.sleep(1.0)
+                    try:
+                        # free 会清掉旧错误并重新进入释放队列
+                        request_retry(sock, "free", name, timeout=30, retries=200)
+                        active.add(name)
+                    except (OSError, RuntimeError) as retry_error:
+                        errors.append(f"{name}: {retry_error}")
+                    continue
+                errors.append(f"{name}: {err}")
                 active.discard(name)
                 continue
             if st.get("state") == "placeholder":
@@ -539,18 +563,18 @@ def main():
                     if skipped:
                         reason = "已下载或已修改" if args.action == "download" else "已保留并下载"
                         msg += f"，跳过 {skipped} 个{reason}文件"
-                    finish_info(msg)
+                    # 成功只写 stdout（GUI 入口 stdout 丢弃），不弹通知。
+                    print(msg, flush=True)
             elif args.action == "free":
                 errs, released, skipped = free_files(sock, files, bulk)
                 errors.extend(errs)
                 failed += bool(errs)
-                # 单文件释放保持“成功不弹提示”；文件夹级操作给一份汇总。
                 if not errs and bulk:
                     msg = f"释放空间：已释放 {released} 个文件"
                     detail = _skip_summary(skipped)
                     if detail:
                         msg += f"；跳过 {detail}"
-                    finish_info(msg)
+                    print(msg, flush=True)
             elif args.action == "unpin":
                 errs, count, skipped = unpin_files(sock, files)
                 errors.extend(errs)
@@ -559,7 +583,7 @@ def main():
                     msg = f"取消始终保留：{count} 个文件"
                     if skipped:
                         msg += f"（{skipped} 个本来未保留）"
-                    finish_info(msg)
+                    print(msg, flush=True)
         except (OSError, ValueError, RuntimeError) as error:
             failed += 1
             errors.append(f"{sock}: {error}")

@@ -287,6 +287,11 @@ pub struct Shared {
     overlays: DashMap<u64, RwLock<Overlay>>,
     /// 删除待执行（rel → 已重试次数）
     pub pending_removes: DashMap<String, u32>,
+    /// 远端已删除、等待清理本地缓存和 inode 的路径（占用/脏文件会延后重试）。
+    remote_deleted: DashMap<String, ()>,
+    /// 远端列表中连续缺失次数。单次缺失可能只是远端列表瞬时不全，
+    /// 连续三次缺失才确认删除，避免图标/缓存反复消失又出现。
+    remote_missing: DashMap<String, u32>,
     /// rel → 正在进行的传输（用于状态展示与进度）
     pub transfers: DashMap<String, Transfer>,
     /// 「始终保留在此电脑」的路径集合（对应官方 PinState=Pinned）。
@@ -299,6 +304,9 @@ pub struct Shared {
     notify_tx: std::sync::mpsc::SyncSender<NotifyMsg>,
     /// 通知线程的接收端（仅用于启动线程时移交）
     notify_rx: Arc<Mutex<std::sync::mpsc::Receiver<NotifyMsg>>>,
+    /// 状态变化广播：Nautilus 扩展订阅后即时刷新角标，不依赖轮询。
+    /// send 在没有订阅者时返回 Err，忽略即可。
+    pub state_tx: tokio::sync::broadcast::Sender<()>,
     /// 阻塞型 FUSE 回调的执行池（见 OpPool 文档）
     pub ops: Arc<OpPool>,
     pub transfer_ops: Arc<OpPool>,
@@ -332,8 +340,10 @@ impl Shared {
         // 失效通知通道：专用线程消费，避免阻塞 runtime
         let (notify_tx, notify_rx) = std::sync::mpsc::sync_channel::<NotifyMsg>(256);
         let notify_rx = Arc::new(Mutex::new(notify_rx));
+        let (state_tx, _) = tokio::sync::broadcast::channel(16);
         let shared = Self {
             notify_rx,
+            state_tx,
             inodes: DashMap::new(),
             ino_by_rel: DashMap::new(),
             dir_cache: DashMap::new(),
@@ -343,6 +353,8 @@ impl Shared {
             meta_dirty: AtomicBool::new(false),
             overlays: DashMap::new(),
             pending_removes: DashMap::new(),
+            remote_deleted: DashMap::new(),
+            remote_missing: DashMap::new(),
             transfers: DashMap::new(),
             pins: DashMap::new(),
             next_ino: AtomicU64::new(ROOT_INO + 1),
@@ -405,7 +417,7 @@ impl Shared {
     /// “本地保留名”处理：只在挂载内存在，读写都走本地，不会出现在 NAS 上。
     /// 这样文件管理器按 Delete 键（移动到回收站）才能成功，
     /// 并把“删除”按官方语义传播到 NAS。
-    fn is_local_only(rel: &str) -> bool {
+    pub(crate) fn is_local_only(rel: &str) -> bool {
         match rel.split('/').next() {
             Some(first) => first == ".Trash" || first.starts_with(".Trash-"),
             None => false,
@@ -448,8 +460,11 @@ impl Shared {
         }
     }
 
-    /// 列出本地目录（用于回收站这类不同步的目录）
-    fn local_list(&self, rel: &str, filter: &FileFilter) -> Vec<RemoteListEntry> {
+    /// 列出本地目录（用于回收站这类不同步的目录）。
+    ///
+    /// 不套用同步过滤规则：回收站路径本身就以 `.` 开头（`.Trash-1000/...`），
+    /// 开了“忽略点文件”时会被整目录过滤掉，文件管理器里就看不到、也清空不了。
+    fn local_list(&self, rel: &str) -> Vec<RemoteListEntry> {
         let mut out = Vec::new();
         let dir = self.local_dir_path(rel);
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -458,16 +473,8 @@ impl Shared {
         for e in rd.flatten() {
             let Ok(meta) = e.metadata() else { continue };
             let name = e.file_name().to_string_lossy().to_string();
-            let child_rel = if rel.is_empty() {
-                name.clone()
-            } else {
-                format!("{rel}/{name}")
-            };
             let is_dir = meta.is_dir();
             let size = if is_dir { 0 } else { meta.len() };
-            if !filter.should_sync(&child_rel, if is_dir { None } else { Some(size) }) {
-                continue;
-            }
             out.push(RemoteListEntry {
                 name,
                 dir: is_dir,
@@ -504,26 +511,32 @@ impl Shared {
         if rel.is_empty() {
             return ROOT_INO;
         }
-        if let Some(ino) = self.ino_by_rel.get(rel) {
-            return *ino;
+        // 查-建必须原子：并发列举同一路径时，两个线程都 miss 会各自分配
+        // inode，`ino_by_rel` 只留下后写入的那个，另一个变成孤儿节点，
+        // 状态快照里同一路径就出现多条。
+        use dashmap::mapref::entry::Entry;
+        match self.ino_by_rel.entry(rel.to_string()) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                let ino = self.alloc_ino();
+                self.inodes.insert(
+                    ino,
+                    RwLock::new(Inode {
+                        rel: rel.to_string(),
+                        kind,
+                        size: 0,
+                        mtime: 0,
+                        stamp: (0, 0),
+                        dirty: false,
+                        pinned: false,
+                        mode: 0,
+                        created: false,
+                    }),
+                );
+                e.insert(ino);
+                ino
+            }
         }
-        let ino = self.alloc_ino();
-        self.ino_by_rel.insert(rel.to_string(), ino);
-        self.inodes.insert(
-            ino,
-            RwLock::new(Inode {
-                rel: rel.to_string(),
-                kind,
-                size: 0,
-                mtime: 0,
-                stamp: (0, 0),
-                dirty: false,
-                pinned: false,
-                mode: 0,
-                created: false,
-            }),
-        );
-        ino
     }
 
     fn drop_inode(&self, rel: &str) {
@@ -571,6 +584,8 @@ impl Shared {
     /// 让文件管理器的状态列自动刷新。
     pub(crate) fn notify_inode(&self, ino: u64) {
         let _ = self.notify_tx.try_send(NotifyMsg::Inode { ino });
+        // 状态事件：Nautilus 扩展订阅 control.sock 后据此立即刷新角标。
+        let _ = self.state_tx.send(());
         // UI consumes daemon status directly; never re-enter the FUSE mount to touch files.
     }
 
@@ -589,7 +604,7 @@ impl Shared {
         };
         // 本地保留名目录（回收站）：只列本地磁盘
         if Self::is_local_only(&rel) {
-            return Ok(self.local_list(&rel, &self.filter));
+            return Ok(self.local_list(&rel));
         }
         if let Some(list) = self.dir_cache.get(&parent) {
             if list.read().fetched.elapsed() < DIR_TTL {
@@ -1393,6 +1408,8 @@ impl Shared {
             .unwrap_or(0);
         self.transfers
             .insert(rel.clone(), Transfer::new("upload", total));
+        // 上传开始也要通知：角标立即从“本地修改”变为“上传中”。
+        self.notify_inode(ino);
 
         // 冲突检测基准 = 本地内容对应的远端戳（下载/上次上传时记录），
         // 而非 inode 上随时被轮询刷新的观察戳。
@@ -1402,6 +1419,18 @@ impl Shared {
         };
         match upload {
             Ok(new_stamp) => {
+                // 上传期间文件被删除：远端刚被写入，必须补删一次，否则留下
+                // 孤儿文件（本地状态已清空，用户再也看不到它）。
+                if self.cache.state(&rel).is_none() {
+                    tracing::info!(rel = %rel, "upload finished after local delete; removing remote copy");
+                    self.transfers.remove(&rel);
+                    let remote = self.remote_path(&rel);
+                    if let Err(e) = self.nas.remove(&[remote]).await {
+                        tracing::warn!(rel = %rel, error = %e, "remote cleanup after concurrent delete failed");
+                        self.pending_removes.insert(rel.clone(), 0);
+                    }
+                    return Ok(());
+                }
                 self.errors.remove(&rel);
                 self.transfers.remove(&rel);
                 let size = self.cache.state(&rel).map(|s| s.size).unwrap_or(0);
@@ -1577,7 +1606,7 @@ impl Shared {
         }
     }
 
-    fn invalidate_parent_listing(&self, parent: u64) {
+    pub(crate) fn invalidate_parent_listing(&self, parent: u64) {
         self.dir_cache.remove(&parent);
     }
 
@@ -1605,10 +1634,13 @@ impl Shared {
             // 的临时文件也能被清掉（只扫本地缓存，代价很小）。
             if tick == 1 || tick % 30 == 0 {
                 self.purge_scratch_leftovers().await;
+                // 远端根目录已删除、但本地仍保留的干净缓存（重启后 inode 丢失）
+                self.purge_orphan_root_cache().await;
             }
             self.flush_meta();
             self.flush_dirty_uploads();
             self.run_pending_removes().await;
+            self.retry_remote_deleted();
             if tick % ROOT_POLL_TICKS == 0 {
                 self.poll_all_diffs().await;
             }
@@ -1778,21 +1810,187 @@ impl Shared {
             }
             self.notify_entry(ino, &entry.name);
         }
-        let fresh_names: HashSet<&str> = fresh.iter().map(|e| e.name.as_str()).collect();
-        for name in previous.keys() {
-            if !fresh_names.contains(name.as_str()) {
-                tracing::debug!(dir = %rel, name, "remote entry removed");
-                self.notify_entry(ino, name);
+        let mut kept: Vec<RemoteListEntry> = Vec::new();
+        let mut confirmed: Vec<(String, String)> = Vec::new();
+        {
+            let fresh_names: HashSet<String> = fresh.iter().map(|e| e.name.clone()).collect();
+            for name in previous.keys() {
+                if fresh_names.contains(name) {
+                    continue;
+                }
+                let child_rel = if rel.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{rel}/{name}")
+                };
+                let count = {
+                    let mut c = self.remote_missing.entry(child_rel.clone()).or_insert(0);
+                    *c += 1;
+                    *c
+                };
+                if count >= 3 {
+                    confirmed.push((name.clone(), child_rel));
+                } else {
+                    // 单次缺失可能只是远端列表瞬时不全（历史 bug：确认帧被当成
+                    // 空目录）。连续三次缺失才确认删除，期间保留旧条目、不隐藏、
+                    // 不删缓存。
+                    if let Some(entry) = previous.get(name) {
+                        kept.push(entry.clone());
+                    }
+                }
+            }
+            // 重新出现的条目重置缺失计数
+            for name in &fresh_names {
+                let child_rel = if rel.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{rel}/{name}")
+                };
+                self.remote_missing.remove(&child_rel);
             }
         }
+        if confirmed.len() >= 10 {
+            // 一次轮询里大量条目同时“消失”几乎不可能是真实删除。留一条警告，
+            // 便于下次排查回包/解析异常。
+            tracing::warn!(
+                dir = %rel,
+                count = confirmed.len(),
+                "remote listing suddenly missing many entries; treating as deletions after 3 consecutive polls"
+            );
+        }
+        for (name, child_rel) in confirmed {
+            self.remote_missing.remove(&child_rel);
+            tracing::debug!(dir = %rel, name = %name, "remote entry removed (confirmed)");
+            // 连续三次缺失才确认删除：清理本地缓存和 inode；占用/脏/保留的
+            // 由 retry_remote_deleted 继续重试。
+            self.remote_deleted.insert(child_rel.clone(), ());
+            self.cleanup_remote_deleted(&child_rel);
+            self.notify_entry(ino, &name);
+        }
+        let mut entries = fresh;
+        entries.extend(kept);
         self.dir_cache.insert(
             ino,
             RwLock::new(DirList {
-                entries: fresh,
+                entries,
                 fetched: Instant::now(),
             }),
         );
         Ok(())
+    }
+
+    /// 远端已删除：释放本地缓存并丢弃 inode。
+    /// 脏文件/已保留/打开中/传输中的先保留，由 worker 每 tick 重试。
+    fn cleanup_remote_deleted(&self, rel: &str) {
+        let Some(ino) = self.ino_by_rel.get(rel).map(|v| *v) else {
+            self.remote_deleted.remove(rel);
+            return;
+        };
+        let Some(node) = self.inodes.get(&ino).map(|n| n.read().clone()) else {
+            self.remote_deleted.remove(rel);
+            return;
+        };
+        if node.dirty || node.pinned || self.is_in_use(rel) || self.transfers.contains_key(rel) {
+            return;
+        }
+        match self.release(rel) {
+            Ok(()) => {
+                self.drop_inode(rel);
+                self.remote_deleted.remove(rel);
+                tracing::info!(rel = %rel, "remote-deleted entry cleaned");
+            }
+            Err(e) => {
+                tracing::debug!(rel = %rel, error = %e, "remote-deleted cleanup deferred")
+            }
+        }
+    }
+
+    fn retry_remote_deleted(&self) {
+        let items: Vec<String> = self
+            .remote_deleted
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+        for rel in items {
+            self.cleanup_remote_deleted(&rel);
+        }
+    }
+
+    /// 清理缓存根目录里的孤儿文件：远端根列表已不存在，且本地没有仍需要的
+    /// inode（或 inode 已干净、未保留、未被占用）。
+    /// 只处理根目录一级文件，避免误删尚未展开子目录的缓存。
+    async fn purge_orphan_root_cache(&self) {
+        // 用未过滤的远端列表：过滤规则会隐藏点文件/忽略扩展名，若用过滤后的
+        // 列表，会把远端仍然存在的 `.notify` 等文件误判为孤儿并删除。
+        let entries = match self.nas.ls(&self.remote_path("")).await {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let names: HashSet<String> = entries.into_iter().map(|e| e.name).collect();
+        let root = self.cache.root().to_path_buf();
+        let Ok(rd) = std::fs::read_dir(&root) else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if names.contains(&name)
+                || Self::is_local_only(&name)
+                // 点文件可能被过滤规则隐藏，无法确认远端状态；一律不自动删。
+                || name.starts_with('.')
+                || is_scratch_name(&name)
+                || self.is_local_scratch(&name)
+                || name == "pins.json"
+                || name == ".meta.json"
+                || name == "control.sock"
+                || name.ends_with(".tmp")
+            {
+                continue;
+            }
+            // 目录缓存仍在展示它（例如第一次缺失、等待二次确认）：交给
+            // poll_dir_diff 处理，避免孤儿清理先删缓存造成“消失又出现”。
+            if self
+                .dir_cache
+                .get(&ROOT_INO)
+                .map(|list| list.read().entries.iter().any(|e| e.name == name))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let stale = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| now.duration_since(t).ok())
+                .map(|d| d.as_secs() >= 60)
+                .unwrap_or(false);
+            if !stale {
+                continue;
+            }
+            if let Some(ino) = self.ino_by_rel.get(&name).map(|v| *v) {
+                let Some(node) = self.inodes.get(&ino).map(|n| n.read().clone()) else {
+                    continue;
+                };
+                if node.dirty
+                    || node.created
+                    || node.pinned
+                    || self.is_in_use(&name)
+                    || self.transfers.contains_key(&name)
+                {
+                    continue;
+                }
+                let _ = self.release(&name);
+                self.drop_inode(&name);
+            } else {
+                // 重启后 inode 已丢失，只剩磁盘上的干净缓存副本；远端已无此文件。
+                let _ = std::fs::remove_file(&path);
+                self.cache.remove(&name);
+            }
+            tracing::info!(rel = %name, "purged orphan root cache");
+        }
     }
 
     async fn wait_stopping(&self) {
@@ -1889,6 +2087,8 @@ async fn apply_write(shared: &Shared, ino: u64, off: u64, data: &[u8]) -> Result
     if !scratch {
         shared.mark_meta_dirty();
     }
+    // 写入后状态变为“本地修改”，立即刷新角标。
+    shared.notify_inode(ino);
     Ok(())
 }
 
@@ -2842,20 +3042,46 @@ impl Shared {
             self.invalidate_parent_listing(parent);
             return Ok(());
         }
-        // 纯本地新建 → 直接丢弃
-        let was_created = self
+        // 本地新建的条目：文件在上传前只存在于本机，直接丢弃；但目录在
+        // `do_mkdir` 时已经真实建到 NAS 上，上传中的文件也可能已经写过去，
+        // 这两类删除必须同步远端，否则远端会留下孤儿（重新列举时它又出现）。
+        let created_ino = self
             .overlays
             .get(&parent)
-            .map(|ov| ov.read().created.contains_key(&name_s))
-            .unwrap_or(false);
-        if was_created {
-            if let Some(ov) = self.overlays.get(&parent) {
-                let mut ov = ov.write();
+            .and_then(|ov| ov.read().created.get(&name_s).copied());
+        if let Some(ino) = created_ino {
+            let is_dir = self
+                .inodes
+                .get(&ino)
+                .map(|n| n.read().kind == FileType::Directory)
+                .unwrap_or(false);
+            // 上传进行中：远端可能已有内容，且上传成功回调还会写一次。
+            // 交给 pending_removes 兜底，并先隐藏条目直到删除确认。
+            let uploading = self
+                .cache
+                .state(&rel)
+                .map(|s| s.uploading)
+                .unwrap_or(false);
+            let touches_remote = is_dir || uploading;
+            {
+                let entry = self.overlays.entry(parent).or_default();
+                let mut ov = entry.write();
                 ov.created.remove(&name_s);
                 ov.scratch.remove(&name_s);
+                if touches_remote {
+                    ov.deleted.insert(name_s.clone());
+                }
             }
-            let _ = std::fs::remove_file(self.cache.file_path(&rel));
+            if touches_remote {
+                self.pending_removes.insert(rel.clone(), 0);
+            }
+            if is_dir {
+                let _ = std::fs::remove_dir_all(self.cache.file_path(&rel));
+            } else {
+                let _ = std::fs::remove_file(self.cache.file_path(&rel));
+            }
             self.cache.remove(&rel);
+            self.drop_inode(&rel);
             self.mark_meta_dirty();
             self.invalidate_parent_listing(parent);
             return Ok(());

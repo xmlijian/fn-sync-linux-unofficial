@@ -11,7 +11,8 @@
 //! - 缓存 LRU 淘汰，释放电脑磁盘；
 //! - 远端变化经轮询 + 内核失效通知实时反映。
 //!
-//! 运行时依赖：内核 fuse 模块 + `fusermount3`（主流发行版预装）。
+//! 运行时依赖：内核 fuse 模块 + `fusermount3` 或 fuse2 的 `fusermount`
+//! （麒麟 134 等目标机只装了 fuse2；回收残留挂载时两者都会尝试）。
 
 pub mod cache;
 pub mod control;
@@ -69,9 +70,29 @@ impl OnDemandMount {
         //
         // 顺序很重要：必须在 create_dir_all 之前。死挂载点的 stat/mkdir 会返回
         // ENOTCONN，create_dir_all 因此失败并提前 return，recover 就永远跑不到。
+        // 若控制 socket 仍有进程应答，说明另一个客户端实例正在使用这个挂载，
+        // 强行卸载会把它的挂载弄坏。此时直接报错，让用户先退出另一个实例。
+        let control_socket = cfg.cache_root.join("control.sock");
+        if is_fuse_mount(&cfg.mountpoint) && control_socket_alive(&control_socket) {
+            return Err(anyhow!(
+                "该电脑文件夹已由另一个飞牛同步实例挂载：{}（请先退出另一个实例）",
+                cfg.mountpoint.display()
+            ));
+        }
         recover_stale_mount(&cfg.mountpoint);
         if is_fuse_mount(&cfg.mountpoint) {
             return Err(anyhow!("旧挂载尚未释放，拒绝重复挂载"));
+        }
+        // 挂载点必须是空目录（与官方 macOS 的 CloudStorage 目录语义一致）：
+        // fuse 不允许挂在非空目录上，硬挂也会把原有文件全部遮蔽，用户会以为文件丢了。
+        // 创建/开启按需同步时已提前校验；这里是兜底（例如用户先建好任务再往目录里放文件）。
+        if let Ok(mut entries) = std::fs::read_dir(&cfg.mountpoint) {
+            if entries.next().is_some() {
+                return Err(anyhow!(
+                    "按需同步要求电脑文件夹为空：{}（请清空该文件夹，或新建一个空文件夹后再选择）",
+                    cfg.mountpoint.display()
+                ));
+            }
         }
         if let Err(e) = std::fs::create_dir_all(&cfg.mountpoint) {
             tracing::warn!(
@@ -312,24 +333,14 @@ fn recover_stale_mount(mountpoint: &std::path::Path) {
         "stale fuse mount detected; unmounting before re-mount"
     );
     // 先试普通卸载：干净、快速，大多数情况足够。
-    let plain_ok = run_with_timeout(
-        std::process::Command::new("fusermount3")
-            .args(["-u", "--"])
-            .arg(mountpoint),
-        Duration::from_secs(3),
-    );
+    let plain_ok = unmount_with_fusermount(mountpoint, false, Duration::from_secs(3));
     if plain_ok && !is_fuse_mount(mountpoint) {
         tracing::info!(mountpoint = %mountpoint.display(), "stale mount removed");
         return;
     }
     // 普通卸载失败（挂载点仍被进程占用 → EBUSY，或守护进程已死 → ENOTCONN）。
     // 延迟卸载不会等待未完成请求，但可能永久阻塞，因此只给它很短的时间。
-    let lazy_ok = run_with_timeout(
-        std::process::Command::new("fusermount3")
-            .args(["-u", "-z", "--"])
-            .arg(mountpoint),
-        Duration::from_secs(2),
-    );
+    let lazy_ok = unmount_with_fusermount(mountpoint, true, Duration::from_secs(2));
     if is_fuse_mount(mountpoint) {
         tracing::warn!(
             mountpoint = %mountpoint.display(),
@@ -340,6 +351,53 @@ fn recover_stale_mount(mountpoint: &std::path::Path) {
         );
     } else {
         tracing::info!(mountpoint = %mountpoint.display(), "stale mount removed (lazy)");
+    }
+}
+
+/// 用 fusermount 卸载挂载点。
+///
+/// 优先 `fusermount3`（fuse3），不存在或失败时回退 fuse2 的 `fusermount`：
+/// 麒麟 134 只装了 fuse2，之前只调 fusermount3 导致崩溃后的死挂载永远回收不掉，
+/// 客户端重启一直报“旧挂载尚未释放”。
+fn unmount_with_fusermount(
+    mountpoint: &std::path::Path,
+    lazy: bool,
+    timeout: Duration,
+) -> bool {
+    for tool in ["fusermount3", "fusermount"] {
+        let mut command = std::process::Command::new(tool);
+        command.arg("-u");
+        if lazy {
+            command.arg("-z");
+        }
+        command.arg("--").arg(mountpoint);
+        if run_with_timeout(&mut command, timeout) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 控制 socket 是否有活着的守护进程在应答。
+///
+/// 用途：区分“自己上次崩溃留下的死挂载”（可以安全回收）和
+/// “另一个客户端实例正在用的挂载”（绝不能抢占）。
+fn control_socket_alive(socket: &std::path::Path) -> bool {
+    use std::io::{BufRead, BufReader, Write};
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    if stream.write_all(b"{\"action\":\"status\"}\n").is_err() {
+        return false;
+    }
+    let mut line = String::new();
+    match BufReader::new(stream).read_line(&mut line) {
+        Ok(n) if n > 0 => serde_json::from_str::<serde_json::Value>(&line)
+            .map(|value| value.get("ok").and_then(|ok| ok.as_bool()) == Some(true))
+            .unwrap_or(false),
+        _ => false,
     }
 }
 
@@ -429,6 +487,63 @@ rw,user_id=1000,group_id=1000,default_permissions";
             "7 1 0:60 / /data rw,nosuid master:1 propagate_from:2 shared:9 - fuse.rclone rclone rw";
         assert!(mountinfo_has_fuse(no_optional, "/data"));
         assert!(mountinfo_has_fuse(many_optional, "/data"));
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    //! 死挂载回收的前提判断：控制 socket 是否还有守护进程应答。
+    use super::control_socket_alive;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fnsync-recovery-{}-{tag}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn live_control_socket_is_detected() {
+        let dir = temp_dir("live");
+        let socket = dir.join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut line = String::new();
+                let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
+                let _ = stream.write_all(b"{\"ok\":true,\"result\":{}}\n");
+            }
+        });
+        assert!(control_socket_alive(&socket));
+        let _ = server.join();
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn missing_socket_is_not_alive() {
+        let path = std::env::temp_dir().join("fnsync-no-such-control.sock");
+        let _ = std::fs::remove_file(&path);
+        assert!(!control_socket_alive(&path));
+    }
+
+    #[test]
+    fn socket_file_without_listener_is_not_alive() {
+        // 崩溃后残留的 socket 文件：存在但没人 accept。
+        let dir = temp_dir("stale");
+        let socket = dir.join("control.sock");
+        std::fs::File::create(&socket).unwrap();
+        assert!(!control_socket_alive(&socket));
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
 
@@ -766,6 +881,66 @@ mod mount_tests {
         assert!(
             !nas.exists("root/wps.txt.~#1"),
             "wps scratch file must never be uploaded"
+        );
+
+        mount.stop().unwrap();
+    }
+
+    /// 回归：远端删除后必须清理本地缓存和 inode。否则快照一直显示 cached，
+    /// 右键菜单仍提供“释放”，但挂载里已无该文件，释放报“文件不存在”。
+    #[tokio::test]
+    #[ignore = "requires /dev/fuse + fusermount3; run with FN_SYNC_FUSE_TEST=1"]
+    async fn remote_delete_frees_local_cache() {
+        if std::env::var("FN_SYNC_FUSE_TEST").as_deref() != Ok("1") {
+            eprintln!("SKIP: set FN_SYNC_FUSE_TEST=1 to run the real mount test");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mountpoint = tmp.path().join("mnt");
+        std::fs::create_dir_all(&mountpoint).unwrap();
+        let nas = Arc::new(FakeNas::new());
+        nas.seed_dir("root");
+        nas.seed("root/gone.txt", b"remote gone");
+        let cfg = make_cfg(mountpoint.clone(), tmp.path().join("cache"));
+        let db = database::open_db(&tmp.path().join("db.sqlite"))
+            .await
+            .unwrap();
+        database::migrate(&db).await.unwrap();
+        let filter = FileFilter::from_db(None);
+        let mount = OnDemandMount::start(cfg, nas.clone() as Arc<dyn RemoteOps>, db, filter)
+            .expect("mount started");
+
+        assert!(
+            wait_until(9000, || mountpoint.join("gone.txt").exists()).await,
+            "file visible"
+        );
+        assert_eq!(
+            std::fs::read(mountpoint.join("gone.txt")).unwrap(),
+            b"remote gone"
+        );
+        assert!(mount.shared.cache.file_path("gone.txt").exists());
+
+        // 直接在 NAS 侧删除，模拟别处/其他客户端删除了这个文件
+        nas.remove(&["root/gone.txt".to_string()])
+            .await
+            .unwrap();
+
+        assert!(
+            wait_until(20000, || !mount
+                .shared
+                .cache
+                .file_path("gone.txt")
+                .exists())
+            .await,
+            "local cache must be freed after remote delete"
+        );
+        assert!(
+            mount.shared.ino_by_rel.get("gone.txt").is_none(),
+            "inode must be dropped after remote delete"
+        );
+        assert!(
+            !mountpoint.join("gone.txt").exists(),
+            "mount entry must disappear"
         );
 
         mount.stop().unwrap();

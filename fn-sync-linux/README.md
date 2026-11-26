@@ -1,6 +1,11 @@
-# fn-sync-linux 开发
+# fn-sync-linux 开发（新系统版 / Tauri 2）
 
-逆向自 fn-sync 0.2.3 Windows/macOS 客户端的 Linux (amd64) 实现。
+逆向自 fn-sync 0.2.3 Windows/macOS 客户端的 Linux 实现。
+
+> **这是新系统版**：Tauri 2 + webkit2gtk-4.1，面向 Ubuntu 22.04+/24.04+、Debian 12+、
+> Fedora 38+ 等较新发行版。麒麟 V10 SP1 / UOS 20（只有 webkit2gtk-4.0）请使用
+> 同级的 `fn-sync-linux-webkit40/`（信创版，Tauri 1）。两个版本的差异与同步约定
+> 见仓库顶层 `README.md`。
 
 ## 构建
 
@@ -14,10 +19,16 @@ sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
 npm install
 npm run build
 
-# 出 deb 包（cargo-deb / tauri bundle）
-cd src-tauri
-cargo tauri build --bundles deb
-# 产物: target/release/bundle/deb/fn-sync-client_0.2.3_amd64.deb
+# 出 deb 包（cargo-deb）
+./debian-build.sh
+# 产物: src-tauri/target/debian/fn-sync-client_0.2.3-20_amd64.deb
+#       （修订号可用 DEB_REVISION 覆盖，默认 20，晚于旧版 0.2.3-19 便于升级）
+
+# AppImage（免安装，依赖系统 webkit2gtk-4.1 / fuse）
+cd src-tauri && cargo build --release && cd ..
+./scripts/build-appimage.sh
+# 产物: artifacts/fn-sync-client-0.2.3-x86_64.AppImage
+# 交付目录: artifacts/新系统版/（deb + AppImage + SHA256SUMS.txt）
 ```
 
 ## 测试
@@ -99,6 +110,10 @@ FN_SYNC_UI_FIXTURES=/tmp/fn-ui-fixtures.json node scripts/qa-ui-smoke.cjs
 - 本地写入落缓存并异步上传（三步上传协议），flush 后由 worker 重试直至成功
 - 远端变化（6s 根目录差异轮询）实时反映；远端已变化而本地基于旧版本修改 → NAS 侧保留双方（Conflicted Copy）
 - 右键菜单：文件支持下载 / 释放 / 始终保留；文件夹支持整目录下载 / 释放 / 保留。文件夹的“保留”是一次性动作，只对点击时已有的文件生效，之后新增的文件不会自动保留
+- 状态角标由守护进程事件推送即时刷新（300ms 轮询兜底）；右键操作成功不弹提示，只有失败才提示
+- 路径解析失败会自动刷新目录；释放/下载的瞬时错误会自动重试
+- 远端删除文件时会同步释放本地缓存并清理 inode；缓存根目录的孤儿副本会自动回收
+- 单次远端列表缺失不会清理条目（连续两次缺失才确认），扩展也会短时保留旧角标，避免图标闪烁
 - 编辑器原子保存（临时文件 + rename）已支持：`.goutputstream-*`、`文件名.~#N` 等临时文件只留本地，改名为正式文件前不会上传；`文件名.~#N` 备份不会被自动删除
 - 缓存 LRU 淘汰（默认上限 10 GiB，system_table `ondemand_cache_limit_bytes` 可覆盖），等价官方“释放电脑磁盘”
 - 崩溃/重启后未上传的修改自动补传（缓存目录 `.meta.json`）
