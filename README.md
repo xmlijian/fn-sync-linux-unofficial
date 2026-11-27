@@ -100,7 +100,8 @@ cd fn-sync-linux-webkit40
 本仓库为 monorepo：
 
 - `fn-sync-linux/` — 新系统版（Tauri 2），保留原有提交历史；
-- `fn-sync-linux-webkit40/` — 信创版（Tauri 1），以子树方式并入（2026-11-26）。
+- `fn-sync-linux-webkit40/` — 信创版（Tauri 1），以子树方式并入（2026-11-26）；
+- `docs/development/` — 开发过程记录（计划、审查、验证报告），非用户文档。
 
 业务代码同源，差异只在框架胶水和平台集成。修改约定：业务修复先改一边，
 再手工回灌另一边，避免两份漂移。当前需同步的关键文件：
