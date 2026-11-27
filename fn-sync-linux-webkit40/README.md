@@ -29,10 +29,12 @@
 # x86_64（UOS 20）：会先构建 DDE 扩展，再用 --variant dde 打包
 ./build-docker.sh
 # 产物: src-tauri/target/debian/fn-sync-client_0.2.3-xinchuang_amd64.deb
+#       （package-xinchuang.sh 汇总时重命名为 xinchuang_fn-sync-client_0.2.3_amd64.deb）
 
 # aarch64（麒麟 V10 SP1 飞腾/麒麟990）：会先构建 Peony 插件，再用 --variant peony 打包
 ./build-docker-arm64.sh
 # 产物: src-tauri/target/debian/fn-sync-client_0.2.3-xinchuang_arm64.deb
+#       （package-xinchuang.sh 汇总时重命名为 xinchuang_fn-sync-client_0.2.3_arm64.deb）
 
 # 单独构建文件管理器插件
 ./scripts/build-dde-plugin.sh     # x86_64 → plugins/dde/build/libfnsync-dde.so
